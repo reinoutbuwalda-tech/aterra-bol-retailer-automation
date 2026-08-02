@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { UserButton } from "@clerk/nextjs";
 import type { Actor } from "@/lib/auth";
 import type { FinanceException, EvidenceSource } from "@/lib/benchmark";
 
@@ -64,7 +65,7 @@ export default function ControlRoom({ actor, initialState }: { actor: Actor; ini
       <div className="brand"><div className="brand-mark">A</div><div><strong>ATERRA</strong><span>Financial system</span></div></div>
       <nav>{nav.map(item => <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}><span>{item.slice(0,1)}</span>{item}{item === "Exceptions" && openCount > 0 ? <b>{openCount}</b> : null}</button>)}</nav>
       <div className="entity-card"><span>Legal entity</span><strong>{initialState.entity.legalName}</strong><small>{initialState.entity.legalForm} · KvK {initialState.entity.kvk}</small></div>
-      <div className="user-card"><div>{actor.name.slice(0, 1).toUpperCase()}</div><p><strong>{actor.name}</strong><span>{actor.role}</span></p></div>
+      <div className="user-card"><UserButton /><p><strong>{actor.name}</strong><span>{actor.role}</span></p></div>
     </aside>
     <main className="workspace">
       <header><div><span className="eyebrow">Financial control room · {revenuePeriod.label}</span><h1>{view}</h1><p>{viewSubtitle}</p></div><div className="header-actions"><span className="live-dot">Evidence connected</span><label className="period"><span>Reporting period</span><select value={periodId} onChange={event => setPeriodId(event.target.value)}>{initialState.revenuePeriods.map(period => <option value={period.id} key={period.id}>{period.label}</option>)}</select></label></div></header>

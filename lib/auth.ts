@@ -1,4 +1,4 @@
-import { requireChatGPTUser } from "@/app/chatgpt-auth";
+import { currentUser } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 
 export type AppRole = "owner" | "architect" | "accountant";
@@ -11,21 +11,25 @@ const ACCESS: Record<string, AppRole> = {
   "hiddebaron@live.nl": "architect",
 };
 
-function actorFor(email: string, name?: string | null): Actor | null {
+export function actorFor(email: string, name?: string | null): Actor | null {
   const normalized = email.toLowerCase();
   const role = ACCESS[normalized];
   return role ? { email: normalized, name: name || normalized.split("@")[0], role } : null;
 }
 
 export async function getActor(): Promise<Actor> {
-  if (process.env.NODE_ENV !== "production") return { email: "reinout.buwalda@gmail.com", name: "Reinout", role: "owner" };
-  const user = await requireChatGPTUser("/");
-  const actor = actorFor(user.email, user.fullName);
+  const user = await currentUser();
+  if (!user) redirect("/sign-in");
+  const email = user.primaryEmailAddress?.emailAddress;
+  const actor = email ? actorFor(email, user.fullName) : null;
   if (!actor) redirect("/unauthorized");
   return actor;
 }
 
 export async function getApiActor(): Promise<Actor | null> {
-  if (process.env.NODE_ENV !== "production") return { email: "reinout.buwalda@gmail.com", name: "Reinout", role: "owner" };
-  try { const user = await requireChatGPTUser("/"); return actorFor(user.email, user.fullName); } catch { return null; }
+  try {
+    const user = await currentUser();
+    const email = user?.primaryEmailAddress?.emailAddress;
+    return email ? actorFor(email, user?.fullName) : null;
+  } catch { return null; }
 }

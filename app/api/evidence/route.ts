@@ -1,9 +1,7 @@
-import { env } from "cloudflare:workers";
 import { NextRequest, NextResponse } from "next/server";
 import { getApiActor } from "@/lib/auth";
+import { getSupabaseAdmin } from "@/lib/supabase-admin";
 import { registerEvidence } from "@/db/runtime";
-
-type Bucket = { put(key: string, value: ArrayBuffer, options?: unknown): Promise<unknown> };
 
 export async function POST(request: NextRequest) {
   const actor = await getApiActor();
@@ -18,9 +16,10 @@ export async function POST(request: NextRequest) {
   const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(v => v.toString(16).padStart(2, "0")).join("");
   const id = crypto.randomUUID();
   const objectKey = `evidence/${new Date().toISOString().slice(0, 10)}/${id}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-  const bucket = (env as unknown as { EVIDENCE?: Bucket }).EVIDENCE;
-  if (!bucket) return NextResponse.json({ error: "Evidence storage is unavailable" }, { status: 503 });
-  await bucket.put(objectKey, bytes, { httpMetadata: { contentType: file.type }, customMetadata: { sha256: hash, actor: actor.email, drivePath } });
+  const db = getSupabaseAdmin();
+  if (!db) return NextResponse.json({ error: "Evidence storage is unavailable" }, { status: 503 });
+  const { error: uploadError } = await db.storage.from("financial-evidence").upload(objectKey, bytes, { contentType: file.type || "application/octet-stream", upsert: false, metadata: { sha256: hash, actor: actor.email, drivePath } });
+  if (uploadError) return NextResponse.json({ error: uploadError.message }, { status: 503 });
   const result = await registerEvidence({ id, fileName: file.name, drivePath, objectKey, sha256: hash, mimeType: file.type || "application/octet-stream" }, actor.email);
   return NextResponse.json({ ...result, id, sha256: hash }, { status: result.ok ? 201 : 503 });
 }

@@ -39,13 +39,20 @@ test("ships the financial control room and removes the starter", async () => {
 });
 
 test("keeps consequential actions behind human and policy gates", async () => {
-  const [auth, exceptionApi, evidenceApi] = await Promise.all([
+  const [auth, exceptionApi, evidenceApi, proxy, database] = await Promise.all([
     readFile(new URL("../lib/auth.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/exceptions/resolve/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/evidence/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../proxy.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/runtime.ts", import.meta.url), "utf8"),
   ]);
   assert.match(auth, /t\.w\.dewaard@gmail\.com/);
   assert.match(auth, /hiddebaron@live\.nl/);
   assert.match(exceptionApi, /Read-only role/);
   assert.match(evidenceApi, /SHA-256/);
+  assert.match(auth, /currentUser/);
+  assert.match(proxy, /auth\.protect/);
+  assert.match(database, /audit_events/);
+  assert.match(database, /getSupabaseAdmin/);
+  assert.doesNotMatch(auth, /ChatGPT/);
 });

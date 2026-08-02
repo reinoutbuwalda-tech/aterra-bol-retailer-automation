@@ -1,81 +1,64 @@
-import { env } from "cloudflare:workers";
 import { benchmark, type FinanceException } from "@/lib/benchmark";
+import { getSupabaseAdmin } from "@/lib/supabase-admin";
 
-type RawDb = { exec(query: string): Promise<unknown>; prepare(query: string): { bind(...values: unknown[]): { run(): Promise<unknown>; all<T>(): Promise<{ results?: T[] }> } } };
 type EvidenceInput = { id: string; fileName: string; drivePath: string; objectKey: string; sha256: string; mimeType: string };
 
-function rawDb(): RawDb | null { return (env as unknown as { DB?: RawDb }).DB || null; }
+const decisionTime = "2026-08-02T00:00:00.000Z";
 
-async function ensureSchema(db: RawDb) {
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS exceptions (id TEXT PRIMARY KEY, title TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, detail TEXT NOT NULL, owner TEXT NOT NULL, resolution TEXT, resolved_by TEXT, resolved_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS source_files (id TEXT PRIMARY KEY, provider_id TEXT, file_name TEXT NOT NULL, drive_path TEXT NOT NULL, drive_file_id TEXT, object_key TEXT, sha256 TEXT NOT NULL, mime_type TEXT, period_start TEXT, period_end TEXT, received_at TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, actor_email TEXT NOT NULL, action TEXT NOT NULL, object_type TEXT NOT NULL, object_id TEXT NOT NULL, before_json TEXT, after_json TEXT, occurred_at TEXT NOT NULL);
-  `);
-  for (const item of benchmark.exceptions) {
-    await db.prepare("INSERT OR IGNORE INTO exceptions (id,title,severity,status,source,detail,owner) VALUES (?,?,?,?,?,?,?)")
-      .bind(item.id, item.title, item.severity, item.status, item.source, item.detail, item.owner).run();
-  }
-  const decisionTime = "2026-08-02T00:00:00.000Z";
-  await db.prepare("UPDATE exceptions SET source='Owner decision', detail=? WHERE id='EX-006'")
-    .bind("Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra.").run();
-  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source=?, detail=?, owner=?, resolution=?, resolved_by=?, resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-006' AND status='open'")
-    .bind("Authoritative VAT identity confirmed", "Owner decision + source comparison", "Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra. NL005313044B88 is not valid for the current entity.", "Reinout", "Set NL868817375B01 as authoritative; reclassify MarktMentor as a billing-profile correction.", "reinout.buwalda@gmail.com", decisionTime, decisionTime).run();
-  await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
-    .bind("decision-vat-id-2026-08-02", "reinout.buwalda@gmail.com", "entity.vat_id.confirm", "legal_entity", "treso-ono", JSON.stringify({ vatId: "NL868817375B01", status: "owner-confirmed", incorrectObservedValue: "NL005313044B88" }), decisionTime).run();
-  await db.prepare("UPDATE exceptions SET title=?, source=?, detail=?, owner=?, updated_at=? WHERE id='EX-004' AND status='open'")
-    .bind("Inventory valuation and landed cost missing", "Supplier + freight evidence", "Opening quantities are confirmed, but COGS and gross margin require approved unit cost and landed-cost valuation.", "Reinout + accountant", decisionTime).run();
-  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-007' AND status='open'")
-    .bind("Bol export window clarified", "Bol's 14-day spans are export windows only. Accounting uses the underlying event dates.", "Use order and adjustment event dates, not export-window dates.", decisionTime, decisionTime).run();
-  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-008' AND status='open'")
-    .bind("Bol order is the revenue event", "A Bol order creates revenue on its order date. Confirmed cancellations, refunds and credit notes reverse revenue and output VAT.", "Activate owner-approved Bol order and reversal policy.", decisionTime, decisionTime).run();
-  await db.prepare("UPDATE exceptions SET title=?, severity='low', status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-009' AND status='open'")
-    .bind("MarktMentor VAT field disregarded", "MarktMentor is treated solely as a third-party analytics subscription; its displayed customer VAT field is excluded from entity identity logic.", "Exclude MarktMentor customer VAT metadata from tax identity checks.", decisionTime, decisionTime).run();
-  for (const [id, objectType, objectId, payload] of [
-    ["decision-revenue-policy-2026-08-02", "accounting_policy", "POL-02", { event: "bol_order_date", cancellation: "bol_confirmation_date", refund: "bol_confirmation_date", creditNote: "bol_confirmation_date" }],
-    ["decision-inventory-opening-2026-08-02", "inventory", "opening-balance", { carafeFruit: 100, carafeRvs: 100, sportsBag: 200, currentSportsBag: 195, warehouse: "Tien Fulfilment" }],
-    ["decision-fulfilment-provider-2026-08-02", "source_provider", "tien-fulfilment", { current: true, historicalProvider: "Max Fulfilment", cutover: "derive from first Tien event" }],
-  ] as const) {
-    await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
-      .bind(id, "reinout.buwalda@gmail.com", "owner.decision.confirm", objectType, objectId, JSON.stringify(payload), decisionTime).run();
-  }
-  await db.prepare("UPDATE exceptions SET title=?, detail=?, owner='Accountant', updated_at=? WHERE id='EX-005' AND status='open'")
-    .bind("Accounting policy accountant countersignature pending", "Reinout approved all ten policy proposals on 2 August 2026. Accountant countersignature is still required before activation for closed reporting and BTW.", decisionTime).run();
-  await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
-    .bind("decision-policy-package-owner-approval-2026-08-02", "reinout.buwalda@gmail.com", "accounting_policy.owner_approve", "accounting_policy_set", "POL-01-POL-10", JSON.stringify({ status: "owner-approved", policies: ["POL-01","POL-02","POL-03","POL-04","POL-05","POL-06","POL-07","POL-08","POL-09","POL-10"], nextGate: "Dutch-accountant countersignature" }), decisionTime).run();
+async function seedGovernanceState() {
+  const db = getSupabaseAdmin();
+  if (!db) return null;
+
+  const exceptions = benchmark.exceptions.map(item => ({
+    id: item.id, title: item.title, severity: item.severity, status: item.status,
+    source: item.source, detail: item.detail, owner: item.owner,
+  }));
+  const { error: exceptionError } = await db.from("exceptions").upsert(exceptions, { onConflict: "id", ignoreDuplicates: true });
+  if (exceptionError) throw exceptionError;
+
+  const decisions = [
+    { id: "decision-vat-id-2026-08-02", actor_email: "reinout.buwalda@gmail.com", action: "entity.vat_id.confirm", object_type: "legal_entity", object_id: "treso-ono", after_json: { vatId: "NL868817375B01", status: "owner-confirmed", incorrectObservedValue: "NL005313044B88" }, occurred_at: decisionTime },
+    { id: "decision-revenue-policy-2026-08-02", actor_email: "reinout.buwalda@gmail.com", action: "owner.decision.confirm", object_type: "accounting_policy", object_id: "POL-02", after_json: { event: "bol_order_date", cancellation: "bol_confirmation_date", refund: "bol_confirmation_date", creditNote: "bol_confirmation_date" }, occurred_at: decisionTime },
+    { id: "decision-inventory-opening-2026-08-02", actor_email: "reinout.buwalda@gmail.com", action: "owner.decision.confirm", object_type: "inventory", object_id: "opening-balance", after_json: { carafeFruit: 100, carafeRvs: 100, sportsBag: 200, currentSportsBag: 195, warehouse: "Tien Fulfilment" }, occurred_at: decisionTime },
+    { id: "decision-fulfilment-provider-2026-08-02", actor_email: "reinout.buwalda@gmail.com", action: "owner.decision.confirm", object_type: "source_provider", object_id: "tien-fulfilment", after_json: { current: true, historicalProvider: "Max Fulfilment", cutover: "derive from first Tien event" }, occurred_at: decisionTime },
+    { id: "decision-policy-package-owner-approval-2026-08-02", actor_email: "reinout.buwalda@gmail.com", action: "accounting_policy.owner_approve", object_type: "accounting_policy_set", object_id: "POL-01-POL-10", after_json: { status: "owner-approved", policies: ["POL-01","POL-02","POL-03","POL-04","POL-05","POL-06","POL-07","POL-08","POL-09","POL-10"], nextGate: "Dutch-accountant countersignature" }, occurred_at: decisionTime },
+  ];
+  const { error: auditError } = await db.from("audit_events").upsert(decisions, { onConflict: "id", ignoreDuplicates: true });
+  if (auditError) throw auditError;
+  return db;
 }
 
 export async function getControlRoomState() {
-  const db = rawDb();
-  if (!db) return benchmark;
   try {
-    await ensureSchema(db);
-    const result = await db.prepare("SELECT id,title,severity,status,source,detail,owner FROM exceptions ORDER BY id").bind().all<FinanceException>();
-    return { ...benchmark, exceptions: result.results?.length ? result.results : benchmark.exceptions };
-  } catch { return benchmark; }
+    const db = await seedGovernanceState();
+    if (!db) return benchmark;
+    const { data, error } = await db.from("exceptions").select("id,title,severity,status,source,detail,owner").order("id");
+    if (error) throw error;
+    return { ...benchmark, exceptions: data?.length ? data as FinanceException[] : benchmark.exceptions };
+  } catch {
+    return benchmark;
+  }
 }
 
 export async function resolveException(id: string, resolution: string, actorEmail: string) {
-  const db = rawDb();
+  const db = getSupabaseAdmin();
   if (!db) return { ok: false, error: "Persistent database is not available in this environment." };
-  await ensureSchema(db);
-  const current = await db.prepare("SELECT * FROM exceptions WHERE id = ?").bind(id).all<Record<string, unknown>>();
-  if (!current.results?.length) return { ok: false, error: "Exception not found." };
+  const { data: current, error: readError } = await db.from("exceptions").select("*").eq("id", id).maybeSingle();
+  if (readError) return { ok: false, error: readError.message };
+  if (!current) return { ok: false, error: "Exception not found." };
   const now = new Date().toISOString();
-  await db.prepare("UPDATE exceptions SET status='resolved', resolution=?, resolved_by=?, resolved_at=?, updated_at=? WHERE id=?").bind(resolution, actorEmail, now, now, id).run();
-  await db.prepare("INSERT INTO audit_events (id,actor_email,action,object_type,object_id,before_json,after_json,occurred_at) VALUES (?,?,?,?,?,?,?,?)")
-    .bind(crypto.randomUUID(), actorEmail, "exception.resolve", "exception", id, JSON.stringify(current.results[0]), JSON.stringify({ status: "resolved", resolution }), now).run();
-  return { ok: true };
+  const { error: updateError } = await db.from("exceptions").update({ status: "resolved", resolution, resolved_by: actorEmail, resolved_at: now, updated_at: now }).eq("id", id);
+  if (updateError) return { ok: false, error: updateError.message };
+  const { error: auditError } = await db.from("audit_events").insert({ id: crypto.randomUUID(), actor_email: actorEmail, action: "exception.resolve", object_type: "exception", object_id: id, before_json: current, after_json: { status: "resolved", resolution }, occurred_at: now });
+  return auditError ? { ok: false, error: auditError.message } : { ok: true };
 }
 
 export async function registerEvidence(input: EvidenceInput, actorEmail: string) {
-  const db = rawDb();
+  const db = getSupabaseAdmin();
   if (!db) return { ok: false, error: "Persistent database is not available in this environment." };
-  await ensureSchema(db);
   const now = new Date().toISOString();
-  await db.prepare("INSERT INTO source_files (id,file_name,drive_path,object_key,sha256,mime_type,received_at,status) VALUES (?,?,?,?,?,?,?,?)")
-    .bind(input.id, input.fileName, input.drivePath, input.objectKey, input.sha256, input.mimeType, now, "received").run();
-  await db.prepare("INSERT INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
-    .bind(crypto.randomUUID(), actorEmail, "evidence.register", "source_file", input.id, JSON.stringify(input), now).run();
-  return { ok: true };
+  const { error: sourceError } = await db.from("source_files").insert({ id: input.id, file_name: input.fileName, drive_path: input.drivePath, object_key: input.objectKey, sha256: input.sha256, mime_type: input.mimeType, received_at: now, status: "received" });
+  if (sourceError) return { ok: false, error: sourceError.message };
+  const { error: auditError } = await db.from("audit_events").insert({ id: crypto.randomUUID(), actor_email: actorEmail, action: "evidence.register", object_type: "source_file", object_id: input.id, after_json: input, occurred_at: now });
+  return auditError ? { ok: false, error: auditError.message } : { ok: true };
 }

@@ -1,12 +1,15 @@
 import type { Metadata } from "next";
+import { ClerkProvider } from "@clerk/nextjs";
 import "./globals.css";
 import "./close.css";
 import "./identity.css";
 import "./inventory.css";
 import "./policy-approval.css";
 import "./revenue-period.css";
+import "./auth.css";
 
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || "https://aterra-financial-control-room.vercel.app"),
   title: "Aterra Financial Control Room",
   description: "Evidence-backed financial operations for Aterra.",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
@@ -14,5 +17,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+  return <ClerkProvider><html lang="en"><body>{children}</body></html></ClerkProvider>;
 }
