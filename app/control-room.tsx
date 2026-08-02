@@ -5,7 +5,7 @@ import type { Actor } from "@/lib/auth";
 import type { FinanceException, EvidenceSource } from "@/lib/benchmark";
 
 type State = {
-  entity: { legalName: string; tradingName: string; legalForm: string; kvk: string; rsin: string };
+  entity: { legalName: string; tradingName: string; legalForm: string; kvk: string; rsin: string; vatId: string; vatIdStatus: string };
   period: string;
   metrics: { label: string; value: string; status: string; note: string }[];
   performance: { day: string; revenue: number }[];
@@ -83,7 +83,7 @@ export default function ControlRoom({ actor, initialState }: { actor: Actor; ini
           <article className="panel"><div className="panel-head"><div><span className="eyebrow">Close checklist</span><h2>Evidence-to-release workflow</h2></div></div><div className="close-list">{initialState.closeSteps.map((item,index)=><div key={item.step}><i className={item.status}>{index+1}</i><p><strong>{item.step}</strong><span>{item.note}</span><small>Owner · {item.owner}</small></p><StatusPill status={item.status}/></div>)}</div></article>
           <article className="panel vat-paper"><div className="panel-head"><div><span className="eyebrow">Diagnostic only</span><h2>Captured BTW lines</h2></div><span className="lock">Not a reserve</span></div><div className="vat-summary"><div><span>Modeled output</span><strong>{initialState.vatWorkingPaper.outputVat}</strong></div><div><span>Captured input</span><strong>{initialState.vatWorkingPaper.inputVat}</strong></div><div><span>Captured net</span><strong>{initialState.vatWorkingPaper.capturedNet}</strong></div></div><p className="warning-copy">{initialState.vatWorkingPaper.note}</p><div className="pnl-table">{initialState.vatWorkingPaper.lines.map(line=><div key={line.label}><span>{line.label}</span><strong className={line.state}>{line.amount}</strong></div>)}</div></article>
         </section>
-        <article className="identity-alert"><div><span className="eyebrow">Critical identity control · EX-006</span><h2>Two VAT IDs found in the Q2 evidence</h2><p>Bol: <strong>NL868817375B01</strong> · MarktMentor: <strong>NL005313044B88</strong></p></div><button onClick={()=>setView("Exceptions")}>Open exception →</button></article>
+        <article className="identity-alert resolved-identity"><div><span className="eyebrow">Identity decision · Confirmed by Reinout</span><h2>{initialState.entity.vatId} is authoritative</h2><p>MarktMentor’s <strong>NL005313044B88</strong> is now treated as incorrect customer-profile data requiring correction.</p></div><button onClick={()=>setView("Exceptions")}>View audit item →</button></article>
       </section>}
 
       {view === "Evidence" && <section className="evidence-grid">{initialState.sources.map(source => <article className="evidence-card" key={source.id} onClick={() => setEvidence(source)}><div><span className="source-icon large">{source.provider.slice(0,2).toUpperCase()}</span><StatusPill status={source.status}/></div><h3>{source.name}</h3><p>{source.note}</p><div className="coverage"><span>Coverage</span><strong>{source.coverage}%</strong><i><b style={{width:`${source.coverage}%`}}/></i></div><small>{source.drivePath}</small></article>)}</section>}

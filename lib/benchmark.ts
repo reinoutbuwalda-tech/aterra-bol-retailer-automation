@@ -3,7 +3,7 @@ export type EvidenceSource = { id: string; name: string; provider: string; kind:
 export type FinanceException = { id: string; title: string; severity: "high" | "medium" | "low"; status: "open" | "resolved"; source: string; detail: string; owner: string };
 
 export const benchmark = {
-  entity: { legalName: "Treso ONO", tradingName: "Aterra", legalForm: "VOF", kvk: "99133954", rsin: "868817375" },
+  entity: { legalName: "Treso ONO", tradingName: "Aterra", legalForm: "VOF", kvk: "99133954", rsin: "868817375", vatId: "NL868817375B01", vatIdStatus: "owner-confirmed" },
   period: "May 2026",
   metrics: [
     { label: "Bol reported revenue", value: "€3,001.69", status: "provisional" as Status, note: "118 sales · 115 orders · 1,225 visits" },
@@ -44,7 +44,8 @@ export const benchmark = {
     { id: "EX-003", title: "Import VAT evidence incomplete", severity: "high", status: "open", source: "Import 4 You", detail: "BTW reserve cannot be released until customs and import VAT evidence is complete.", owner: "Reinout" },
     { id: "EX-004", title: "Inventory opening balance missing", severity: "high", status: "open", source: "Historical fulfilment", detail: "COGS and gross margin remain blocked without an approved opening inventory position.", owner: "Reinout" },
     { id: "EX-005", title: "Accounting policy set pending", severity: "medium", status: "open", source: "Governance", detail: "Revenue, refunds, FX, stock, VAT and period close policies require accountant approval.", owner: "Accountant" },
-    { id: "EX-006", title: "Conflicting VAT identities", severity: "high", status: "open", source: "Bol + MarktMentor invoices", detail: "Bol identifies Treso ONO as NL868817375B01, while MarktMentor uses NL005313044B88. No VAT return can be released until the Belastingdienst registration letter confirms the authoritative identity.", owner: "Reinout + Thijs" },
+    { id: "EX-006", title: "Authoritative VAT identity confirmed", severity: "high", status: "resolved", source: "Owner decision + source comparison", detail: "Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra. NL005313044B88 is not valid for the current entity.", owner: "Reinout" },
+    { id: "EX-009", title: "Correct MarktMentor billing profile", severity: "medium", status: "open", source: "MarktMentor invoices", detail: "MarktMentor invoices use the non-authoritative VAT ID NL005313044B88. Update the customer profile to NL868817375B01 and request corrected documents where appropriate.", owner: "Reinout" },
     { id: "EX-007", title: "Cross-period Bol allocation", severity: "medium", status: "open", source: "Bol settlements", detail: "The 24 Apr–7 May and 25 May–7 Jun documents cross month-end. May fee and correction lines require event-level allocation under an approved policy.", owner: "Accountant" },
     { id: "EX-008", title: "Bol Omzet accounting meaning", severity: "high", status: "open", source: "Bol daily sales", detail: "€3,001.69 appears to be net-of-VAT commercial revenue, but order-level tax and return evidence is required before it becomes ledger revenue.", owner: "Accountant" },
   ] as FinanceException[],
@@ -60,7 +61,7 @@ export const benchmark = {
   ],
   closeSteps: [
     { step: "Freeze May source manifest", status: "confirmed", owner: "System", note: "Bol daily files and KNAB statement are fingerprinted; Drive invoice IDs are registered." },
-    { step: "Validate legal and VAT identity", status: "blocked", owner: "Reinout + Thijs", note: "Conflicting VAT IDs require the Belastingdienst registration letter." },
+    { step: "Validate legal and VAT identity", status: "confirmed", owner: "Reinout", note: "NL868817375B01 confirmed as authoritative; registration letter remains useful supporting evidence." },
     { step: "Reconcile Bol settlements to KNAB", status: "confirmed", owner: "System", note: "Three exact matches; €0.00 difference." },
     { step: "Allocate fees, refunds and service periods", status: "provisional", owner: "Accountant", note: "Cross-month Bol documents and MarktMentor prepayment need approved timing rules." },
     { step: "Reconcile inventory and COGS", status: "blocked", owner: "Reinout + warehouse", note: "Opening stock, receipts and closing count are missing." },
@@ -79,7 +80,7 @@ export const benchmark = {
       { label: "Bol commission input VAT · captured Q2", amount: "€304.00", state: "provisional" },
       { label: "Bol advertising input VAT · captured Q2", amount: "€19.41", state: "provisional" },
       { label: "Max May service invoice input VAT", amount: "€79.42", state: "confirmed" },
-      { label: "MarktMentor invoice input VAT", amount: "€10.29", state: "blocked" },
+      { label: "MarktMentor invoice input VAT", amount: "€10.29", state: "provisional" },
       { label: "Import VAT", amount: "Missing", state: "blocked" },
     ],
   },
@@ -89,7 +90,7 @@ export const benchmark = {
     { id: "POL-03", name: "Marketplace settlements", proposal: "Post revenue, corrections, fees, input VAT and cash as separate balanced legs; never book the net payout as revenue.", status: "ready", impact: "Preserves correct margin, VAT and bank reconciliation." },
     { id: "POL-04", name: "Service-period allocation", proposal: "Accrue services to the period received and carry future service days as prepayments; split documents crossing month-end.", status: "accountant review", impact: "Affects Bol fees, fulfilment and MarktMentor costs." },
     { id: "POL-05", name: "Inventory and COGS", proposal: "Activate only after an opening stock valuation and approved cost-flow method; allocate directly attributable landed cost to inventory.", status: "decision required", impact: "Gross margin remains blocked until approved." },
-    { id: "POL-06", name: "Dutch input VAT", proposal: "Deduct only eligible business VAT supported by a compliant invoice and the authoritative Aterra VAT identity.", status: "accountant review", impact: "Blocks the conflicting MarktMentor invoice from the working paper." },
+    { id: "POL-06", name: "Dutch input VAT", proposal: "Deduct only eligible business VAT supported by a compliant invoice and the authoritative Aterra VAT identity NL868817375B01.", status: "accountant review", impact: "The MarktMentor customer profile must be corrected and its invoice treatment reviewed." },
     { id: "POL-07", name: "Import VAT and duty", proposal: "Record duty as landed cost; recognize import VAT separately only with customs declaration, importer match and payment/article-23 evidence.", status: "accountant review", impact: "Prevents invoice VAT rates from being mistaken for import VAT." },
     { id: "POL-08", name: "Foreign currency", proposal: "Use one approved exchange-rate source and policy date; preserve original currency and post realized differences separately.", status: "decision required", impact: "Makes supplier liabilities and inventory reproducible." },
     { id: "POL-09", name: "Period close", proposal: "Freeze source hashes, mappings, policy versions and formulas; closed periods require four-eyes reopening and restatement lineage.", status: "ready", impact: "Prevents silent historical rewrites." },

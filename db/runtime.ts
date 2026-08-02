@@ -16,6 +16,11 @@ async function ensureSchema(db: RawDb) {
     await db.prepare("INSERT OR IGNORE INTO exceptions (id,title,severity,status,source,detail,owner) VALUES (?,?,?,?,?,?,?)")
       .bind(item.id, item.title, item.severity, item.status, item.source, item.detail, item.owner).run();
   }
+  const decisionTime = "2026-08-02T00:00:00.000Z";
+  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source=?, detail=?, owner=?, resolution=?, resolved_by=?, resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-006' AND status='open'")
+    .bind("Authoritative VAT identity confirmed", "Owner decision + source comparison", "Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra. NL005313044B88 is not valid for the current entity.", "Reinout", "Set NL868817375B01 as authoritative; reclassify MarktMentor as a billing-profile correction.", "reinout.buwalda@gmail.com", decisionTime, decisionTime).run();
+  await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
+    .bind("decision-vat-id-2026-08-02", "reinout.buwalda@gmail.com", "entity.vat_id.confirm", "legal_entity", "treso-ono", JSON.stringify({ vatId: "NL868817375B01", status: "owner-confirmed", incorrectObservedValue: "NL005313044B88" }), decisionTime).run();
 }
 
 export async function getControlRoomState() {
