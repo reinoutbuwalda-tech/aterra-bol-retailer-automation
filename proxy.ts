@@ -1,19 +1,15 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
-import { NextResponse } from "next/server";
 
-const isPublicRoute = createRouteMatcher(["/sign-in(.*)", "/unauthorized(.*)"]);
+const isPublicRoute = createRouteMatcher([
+  "/sign-in(.*)",
+  "/unauthorized(.*)",
+  "/api/webhooks/google(.*)",
+  "/api/cron/google-sync(.*)",
+]);
 
 export default clerkMiddleware(async (auth, request) => {
   if (isPublicRoute(request)) return;
-
-  const { userId } = await auth();
-  if (userId) return;
-
-  if (request.nextUrl.pathname.startsWith("/api/")) {
-    return NextResponse.json({ error: "Authentication required" }, { status: 401 });
-  }
-
-  return NextResponse.redirect(new URL("/sign-in", request.url));
+  await auth.protect();
 });
 
 export const config = {

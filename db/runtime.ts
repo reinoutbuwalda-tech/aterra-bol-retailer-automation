@@ -1,5 +1,6 @@
 import { benchmark, type FinanceException } from "@/lib/benchmark";
 import { getSupabaseAdmin } from "@/lib/supabase-admin";
+import { getGoogleSyncHealth } from "@/lib/google-integration";
 
 type EvidenceInput = { id: string; fileName: string; drivePath: string; objectKey: string; sha256: string; mimeType: string };
 
@@ -29,14 +30,24 @@ async function seedGovernanceState() {
 }
 
 export async function getControlRoomState() {
+  const googleSync = await getGoogleSyncHealth().catch(() => ({
+    status: "configuration_needed" as const,
+    accountEmail: "aterra.eu@gmail.com",
+    gmailLastSuccess: null,
+    driveLastSuccess: null,
+    pendingJobs: 0,
+    failedJobs: 0,
+    intakeFolders: 7,
+    driveUrl: "https://drive.google.com/drive/folders/1FRRQRwyXZKyP5kaBE_4tja-HQU0EHjSS",
+  }));
   try {
     const db = await seedGovernanceState();
-    if (!db) return benchmark;
+    if (!db) return { ...benchmark, googleSync };
     const { data, error } = await db.from("exceptions").select("id,title,severity,status,source,detail,owner").order("id");
     if (error) throw error;
-    return { ...benchmark, exceptions: data?.length ? data as FinanceException[] : benchmark.exceptions };
+    return { ...benchmark, exceptions: data?.length ? data as FinanceException[] : benchmark.exceptions, googleSync };
   } catch {
-    return benchmark;
+    return { ...benchmark, googleSync };
   }
 }
 
