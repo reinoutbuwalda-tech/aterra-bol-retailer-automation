@@ -6,6 +6,7 @@ import "./identity.css";
 import "./inventory.css";
 import "./policy-approval.css";
 import "./revenue-period.css";
+import "./pnl.css";
 import "./auth.css";
 
 export const metadata: Metadata = {

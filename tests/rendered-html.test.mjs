@@ -20,10 +20,17 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(ui, /All ten policy proposals approved/);
   assert.match(ui, /Reporting period/);
   assert.match(ui, /Customer sales value · incl\. BTW/);
+  assert.match(ui, /Management P&amp;L/);
+  assert.match(ui, /Profit &amp; loss line/);
+  assert.match(ui, /Review evidence/);
+  assert.match(ui, /drive-document-link/);
+  assert.match(ui, /document ↗/);
   assert.match(ui, /Refunds, cancellations and credit notes remain separate reversals/);
   assert.match(benchmark, /€3,001\.69/);
   assert.match(benchmark, /revenueExVat: 5210\.96/);
   assert.match(benchmark, /revenueIncVat: 6305\.26/);
+  assert.match(benchmark, /1gf8aMMgVAgbVV5aR6Y8e5uboq7eJSXYg/);
+  assert.match(benchmark, /1XQcm0FZEe6h_WTO5YxZFTMbOVIfFiBkA/);
   assert.match(benchmark, /Treso ONO/);
   assert.match(benchmark, /NL868817375B01/);
   assert.match(benchmark, /owner-confirmed/);
