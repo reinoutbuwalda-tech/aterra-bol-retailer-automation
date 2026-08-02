@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import "./close.css";
 import "./identity.css";
+import "./inventory.css";
 
 export const metadata: Metadata = {
   title: "Aterra Financial Control Room",

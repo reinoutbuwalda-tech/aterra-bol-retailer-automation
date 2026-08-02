@@ -13,12 +13,16 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(ui, /Bol revenue progression/);
   assert.match(ui, /Traceability chain/);
   assert.match(ui, /Captured BTW lines/);
-  assert.match(ui, /is authoritative/);
+  assert.match(ui, /Operating model/);
+  assert.match(ui, /Opening to current inventory/);
+  assert.match(ui, /Bol orders → revenue/);
   assert.match(benchmark, /€3,001\.69/);
   assert.match(benchmark, /Treso ONO/);
   assert.match(benchmark, /NL868817375B01/);
-  assert.match(benchmark, /NL005313044B88/);
   assert.match(benchmark, /owner-confirmed/);
+  assert.match(benchmark, /Fruit-infuser carafe/);
+  assert.match(benchmark, /current: 195/);
+  assert.match(benchmark, /order date/);
   assert.match(benchmark, /not the BTW reserve/i);
   assert.match(css, /--forest:#4a6741/);
   assert.doesNotMatch(ui + layout, /Starter Project|react-loading-skeleton/);

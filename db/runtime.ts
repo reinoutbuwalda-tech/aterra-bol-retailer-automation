@@ -17,10 +17,28 @@ async function ensureSchema(db: RawDb) {
       .bind(item.id, item.title, item.severity, item.status, item.source, item.detail, item.owner).run();
   }
   const decisionTime = "2026-08-02T00:00:00.000Z";
+  await db.prepare("UPDATE exceptions SET source='Owner decision', detail=? WHERE id='EX-006'")
+    .bind("Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra.").run();
   await db.prepare("UPDATE exceptions SET title=?, status='resolved', source=?, detail=?, owner=?, resolution=?, resolved_by=?, resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-006' AND status='open'")
     .bind("Authoritative VAT identity confirmed", "Owner decision + source comparison", "Reinout confirmed NL868817375B01 as the authoritative VAT ID for Treso ONO/Aterra. NL005313044B88 is not valid for the current entity.", "Reinout", "Set NL868817375B01 as authoritative; reclassify MarktMentor as a billing-profile correction.", "reinout.buwalda@gmail.com", decisionTime, decisionTime).run();
   await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
     .bind("decision-vat-id-2026-08-02", "reinout.buwalda@gmail.com", "entity.vat_id.confirm", "legal_entity", "treso-ono", JSON.stringify({ vatId: "NL868817375B01", status: "owner-confirmed", incorrectObservedValue: "NL005313044B88" }), decisionTime).run();
+  await db.prepare("UPDATE exceptions SET title=?, source=?, detail=?, owner=?, updated_at=? WHERE id='EX-004' AND status='open'")
+    .bind("Inventory valuation and landed cost missing", "Supplier + freight evidence", "Opening quantities are confirmed, but COGS and gross margin require approved unit cost and landed-cost valuation.", "Reinout + accountant", decisionTime).run();
+  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-007' AND status='open'")
+    .bind("Bol export window clarified", "Bol's 14-day spans are export windows only. Accounting uses the underlying event dates.", "Use order and adjustment event dates, not export-window dates.", decisionTime, decisionTime).run();
+  await db.prepare("UPDATE exceptions SET title=?, status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-008' AND status='open'")
+    .bind("Bol order is the revenue event", "A Bol order creates revenue on its order date. Confirmed cancellations, refunds and credit notes reverse revenue and output VAT.", "Activate owner-approved Bol order and reversal policy.", decisionTime, decisionTime).run();
+  await db.prepare("UPDATE exceptions SET title=?, severity='low', status='resolved', source='Owner decision', detail=?, owner='Reinout', resolution=?, resolved_by='reinout.buwalda@gmail.com', resolved_at=COALESCE(resolved_at,?), updated_at=? WHERE id='EX-009' AND status='open'")
+    .bind("MarktMentor VAT field disregarded", "MarktMentor is treated solely as a third-party analytics subscription; its displayed customer VAT field is excluded from entity identity logic.", "Exclude MarktMentor customer VAT metadata from tax identity checks.", decisionTime, decisionTime).run();
+  for (const [id, objectType, objectId, payload] of [
+    ["decision-revenue-policy-2026-08-02", "accounting_policy", "POL-02", { event: "bol_order_date", cancellation: "bol_confirmation_date", refund: "bol_confirmation_date", creditNote: "bol_confirmation_date" }],
+    ["decision-inventory-opening-2026-08-02", "inventory", "opening-balance", { carafeFruit: 100, carafeRvs: 100, sportsBag: 200, currentSportsBag: 195, warehouse: "Tien Fulfilment" }],
+    ["decision-fulfilment-provider-2026-08-02", "source_provider", "tien-fulfilment", { current: true, historicalProvider: "Max Fulfilment", cutover: "derive from first Tien event" }],
+  ] as const) {
+    await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
+      .bind(id, "reinout.buwalda@gmail.com", "owner.decision.confirm", objectType, objectId, JSON.stringify(payload), decisionTime).run();
+  }
 }
 
 export async function getControlRoomState() {
