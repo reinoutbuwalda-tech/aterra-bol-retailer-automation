@@ -79,6 +79,22 @@ export const benchmark = {
     { gate: "Negotiation draft send", approver: "Human only", state: "Phase 2" },
     { gate: "Ten-policy owner approval", approver: "Reinout · 2 Aug 2026", state: "Active" },
   ],
+  operatingControls: [
+    { id: "daily-intake", cadence: "Daily", name: "Intake and integration health", owner: "Thijs", checker: "Reinout", deadline: "Before 10:00", scope: "Gmail, Drive, failed jobs, expiring connections and broken evidence links." },
+    { id: "daily-exceptions", cadence: "Daily", name: "Material exception triage", owner: "Reinout", checker: "Thijs", deadline: "Same business day", scope: "High-severity VAT, revenue, inventory and supplier-document exceptions." },
+    { id: "weekly-control", cadence: "Weekly", name: "Finance control review", owner: "Reinout", checker: "Thijs", deadline: "Monday 12:00", scope: "Bank balance, Bol revenue, settlements, returns, invoices, stock, BTW reserve and open exceptions." },
+    { id: "monthly-close", cadence: "Monthly", name: "Evidence-backed period close", owner: "Reinout", checker: "Thijs + accountant", deadline: "Fifth working day", scope: "Source completeness, reconciliations, COGS, VAT working paper, owner release and period lock." },
+    { id: "policy-change", cadence: "On change", name: "Formula and policy change control", owner: "Proposer", checker: "Other owner + accountant", deadline: "Before release", scope: "Impact preview, version, effective date, test evidence and four-eyes approval." },
+  ],
+  bankConnection: {
+    bank: "KNAB Zakelijk",
+    recommendedProvider: "Ponto Open Banking",
+    status: "research complete",
+    freshness: "Four automatic synchronizations per day, plus a user-present refresh when fresher data is required.",
+    truthRule: "Show current and available balance separately, together with the provider synchronization timestamp. Never label a cached balance as live.",
+    consentRule: "Monitor consent expiry and notify Reinout 15 days before reauthorization is required; most bank authorizations last about 180 days.",
+    fallback: "Continue ingesting official KNAB MT940, CSV or PDF statements for period-close evidence and recovery.",
+  },
   providers: [
     { name: "Max Fulfilment", period: "Historical", note: "Read-only comparison baseline" },
     { name: "Tien Fulfilment", period: "Current", note: "Onboarding and schema mapping" },

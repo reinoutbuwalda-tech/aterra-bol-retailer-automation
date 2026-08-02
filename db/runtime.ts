@@ -5,6 +5,17 @@ import { getGoogleSyncHealth } from "@/lib/google-integration";
 type EvidenceInput = { id: string; fileName: string; drivePath: string; objectKey: string; sha256: string; mimeType: string };
 
 const decisionTime = "2026-08-02T00:00:00.000Z";
+const weeklyReviewers = ["reinout.buwalda@gmail.com", "t.w.dewaard@gmail.com"];
+
+export function currentWeeklyReview(date = new Date()) {
+  const amsterdamDate = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Amsterdam", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+  const monday = new Date(`${amsterdamDate}T12:00:00.000Z`);
+  const day = monday.getUTCDay() || 7;
+  monday.setUTCDate(monday.getUTCDate() - day + 1);
+  const periodKey = monday.toISOString().slice(0, 10);
+  const label = `Week of ${new Intl.DateTimeFormat("en-NL", { dateStyle: "medium", timeZone: "UTC" }).format(monday)}`;
+  return { periodKey, label, required: weeklyReviewers };
+}
 
 async function seedGovernanceState() {
   const db = getSupabaseAdmin();
@@ -42,13 +53,51 @@ export async function getControlRoomState() {
   }));
   try {
     const db = await seedGovernanceState();
-    if (!db) return { ...benchmark, googleSync };
+    if (!db) return { ...benchmark, googleSync, weeklyReview: { ...currentWeeklyReview(), signed: [] } };
     const { data, error } = await db.from("exceptions").select("id,title,severity,status,source,detail,owner").order("id");
     if (error) throw error;
-    return { ...benchmark, exceptions: data?.length ? data as FinanceException[] : benchmark.exceptions, googleSync };
+    const weekly = currentWeeklyReview();
+    const { data: signed, error: signedError } = await db.from("approvals")
+      .select("actor_email,decided_at")
+      .eq("subject_type", "weekly_finance_control")
+      .eq("subject_id", weekly.periodKey)
+      .order("decided_at");
+    if (signedError) throw signedError;
+    return { ...benchmark, exceptions: data?.length ? data as FinanceException[] : benchmark.exceptions, googleSync, weeklyReview: { ...weekly, signed: signed || [] } };
   } catch {
-    return { ...benchmark, googleSync };
+    return { ...benchmark, googleSync, weeklyReview: { ...currentWeeklyReview(), signed: [] } };
   }
+}
+
+export async function signWeeklyReview(actorEmail: string) {
+  const normalized = actorEmail.toLowerCase();
+  if (!weeklyReviewers.includes(normalized)) return { ok: false, error: "Only Reinout and Thijs can sign the weekly finance control." };
+  const db = getSupabaseAdmin();
+  if (!db) return { ok: false, error: "Persistent database is not available in this environment." };
+  const weekly = currentWeeklyReview();
+  const now = new Date().toISOString();
+  const id = `weekly-finance-control:${weekly.periodKey}:${normalized}`;
+  const approval = {
+    id,
+    subject_type: "weekly_finance_control",
+    subject_id: weekly.periodKey,
+    decision: "reviewed",
+    rationale: "Reviewed bank balance, Bol revenue, settlements, returns, invoices, inventory, BTW reserve and open exceptions.",
+    actor_email: normalized,
+    decided_at: now,
+  };
+  const { error } = await db.from("approvals").upsert(approval, { onConflict: "id", ignoreDuplicates: true });
+  if (error) return { ok: false, error: error.message };
+  const { error: auditError } = await db.from("audit_events").upsert({
+    id,
+    actor_email: normalized,
+    action: "weekly_finance_control.sign",
+    object_type: "weekly_finance_control",
+    object_id: weekly.periodKey,
+    after_json: { decision: "reviewed", checklist: ["bank", "revenue", "settlements", "returns", "invoices", "inventory", "vat", "exceptions"] },
+    occurred_at: now,
+  }, { onConflict: "id", ignoreDuplicates: true });
+  return auditError ? { ok: false, error: auditError.message } : { ok: true, signed: { actor_email: normalized, decided_at: now } };
 }
 
 export async function resolveException(id: string, resolution: string, actorEmail: string) {

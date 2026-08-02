@@ -1,0 +1,31 @@
+.operating-agreement > p,
+.weekly-review > p,
+.bank-feed-card > p { color: var(--muted); font-size: 13px; line-height: 1.55; }
+.control-routine-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 22px; }
+.control-routine-grid > div { background: var(--cream); border: 1px solid var(--line); border-radius: 9px; padding: 16px; }
+.control-routine-grid span { display: block; color: var(--taupe); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.control-routine-grid h3 { font-size: 17px; margin: 10px 0 8px; }
+.control-routine-grid p { color: var(--muted); font-size: 11px; line-height: 1.45; min-height: 64px; }
+.control-routine-grid small { display: grid; grid-template-columns: auto 1fr; gap: 4px 7px; color: var(--muted); font-size: 10px; }
+.control-routine-grid small strong,
+.control-routine-grid small b { color: var(--ink); font-weight: 600; }
+.weekly-review .panel-head > strong { font: 28px Georgia, serif; color: var(--forest); }
+.review-signers { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 18px 0; }
+.review-signers > div { display: grid; grid-template-columns: 1fr auto; gap: 5px; background: var(--cream); border-radius: 8px; padding: 13px; }
+.review-signers span { font-weight: 700; font-size: 12px; }
+.review-signers small { grid-column: 1 / -1; color: var(--muted); font-size: 10px; }
+.audit-copy { font-size: 10px !important; margin-bottom: 0; }
+.bank-truth { background: var(--sage); border-left: 3px solid var(--forest); padding: 14px; margin: 17px 0; }
+.bank-truth span,
+.bank-truth strong { display: block; }
+.bank-truth span { color: var(--forest); font-size: 9px; text-transform: uppercase; letter-spacing: .1em; }
+.bank-truth strong { font-size: 12px; line-height: 1.5; margin-top: 6px; }
+.bank-feed-card ul { padding-left: 18px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.bank-feed-card li { margin: 8px 0; }
+.research-link { display: inline-flex; color: var(--forest); font-size: 11px; text-decoration: none; margin-top: 6px; }
+@media (max-width: 1250px) { .control-routine-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 760px) {
+  .control-routine-grid,
+  .review-signers { grid-template-columns: 1fr; }
+  .control-routine-grid p { min-height: 0; }
+}

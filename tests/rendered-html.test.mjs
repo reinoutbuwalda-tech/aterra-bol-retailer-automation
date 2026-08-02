@@ -26,6 +26,9 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(ui, /drive-document-link/);
   assert.match(ui, /document ↗/);
   assert.match(ui, /Refunds, cancellations and credit notes remain separate reversals/);
+  assert.match(ui, /Reinout–Thijs operating agreement/);
+  assert.match(ui, /Record my weekly review/);
+  assert.match(benchmark, /Ponto Open Banking/);
   assert.match(benchmark, /€3,001\.69/);
   assert.match(benchmark, /revenueExVat: 5210\.96/);
   assert.match(benchmark, /revenueIncVat: 6305\.26/);
@@ -46,10 +49,11 @@ test("ships the financial control room and removes the starter", async () => {
 });
 
 test("keeps consequential actions behind human and policy gates", async () => {
-  const [auth, exceptionApi, evidenceApi, proxy, database] = await Promise.all([
+  const [auth, exceptionApi, evidenceApi, weeklyApi, proxy, database] = await Promise.all([
     readFile(new URL("../lib/auth.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/exceptions/resolve/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/evidence/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/controls/weekly-signoff/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../proxy.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/runtime.ts", import.meta.url), "utf8"),
   ]);
@@ -57,9 +61,11 @@ test("keeps consequential actions behind human and policy gates", async () => {
   assert.match(auth, /hiddebaron@live\.nl/);
   assert.match(exceptionApi, /Read-only role/);
   assert.match(evidenceApi, /SHA-256/);
+  assert.match(weeklyApi, /signWeeklyReview/);
   assert.match(auth, /currentUser/);
   assert.match(proxy, /auth\.protect/);
   assert.match(database, /audit_events/);
+  assert.match(database, /weekly_finance_control/);
   assert.match(database, /getSupabaseAdmin/);
   assert.doesNotMatch(auth, /ChatGPT/);
 });
