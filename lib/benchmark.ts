@@ -5,6 +5,24 @@ export type FinanceException = { id: string; title: string; severity: "high" | "
 export const benchmark = {
   entity: { legalName: "Treso ONO", tradingName: "Aterra", legalForm: "VOF", kvk: "99133954", rsin: "868817375", vatId: "NL868817375B01", vatIdStatus: "owner-confirmed" },
   period: "May 2026",
+  revenuePeriods: [
+    {
+      id: "may", label: "May 2026", scope: "1–31 May 2026",
+      revenueExVat: 3001.69, revenueIncVat: 3632.04, sales: 118, orders: 115, visits: 1225,
+      performance: [
+        { day: "1–5", revenue: 354 }, { day: "6–10", revenue: 432 }, { day: "11–15", revenue: 517 },
+        { day: "16–20", revenue: 621 }, { day: "21–25", revenue: 493 }, { day: "26–31", revenue: 585 },
+      ],
+    },
+    {
+      id: "ytd", label: "2026 cumulative", scope: "Available Bol reports · 20 Apr–1 Aug 2026",
+      revenueExVat: 5210.96, revenueIncVat: 6305.26, sales: 206, orders: 181, visits: null,
+      performance: [
+        { day: "Apr", revenue: 244.54 }, { day: "May", revenue: 3001.69 },
+        { day: "Jun", revenue: 1915.16 }, { day: "Jul", revenue: 49.57 },
+      ],
+    },
+  ],
   metrics: [
     { label: "Bol reported revenue", value: "€3,001.69", status: "provisional" as Status, note: "118 sales · 115 orders · 1,225 visits" },
     { label: "Current bank balance", value: "€994.58", status: "confirmed" as Status, note: "KNAB closing balance · 31 May" },
@@ -30,7 +48,7 @@ export const benchmark = {
   ],
   sources: [
     { id: "kvk", name: "Chamber of Commerce extract", provider: "KvK", kind: "Legal identity", period: "Current", drivePath: "Essential company/uittreksel_handelsregister_99133954.pdf", status: "confirmed", coverage: 100, note: "Defines entity and authorized partners." },
-    { id: "bol-daily", name: "Articles per day", provider: "Bol.com", kind: "Sales", period: "May 2026", drivePath: "Finance/Bol.com/Sales reports/May 2026", status: "confirmed", coverage: 100, note: "31 unique dates, two EANs; overlaps deduplicated by date + EAN." },
+    { id: "bol-daily", name: "Articles per day", provider: "Bol.com", kind: "Sales", period: "20 Apr–1 Aug 2026", drivePath: "Finance/Bol.com/Sales reports/2026", status: "confirmed", coverage: 100, note: "Nine overlapping export rows were deduplicated by date + EAN. The resulting 206 sales equal the Bol cumulative article summary; reported order revenue is €5,210.96 excluding BTW." },
     { id: "bol-return", name: "Return analysis", provider: "Bol.com", kind: "Returns", period: "2026 YTD", drivePath: "Finance/Bol.com/Return reports/2026", status: "provisional", coverage: 92, note: "Exact duplicate RVS row quarantined." },
     { id: "knab-may", name: "May bank statement", provider: "KNAB", kind: "Bank", period: "May 2026", drivePath: "Finance/Bank/2026/05-May.pdf", status: "confirmed", coverage: 100, note: "Opening €5,009.53; credits €442.22; debits €4,457.17; close €994.58." },
     { id: "bol-settlement", name: "Settlement specifications", provider: "Bol.com", kind: "Settlement", period: "May–June 2026", drivePath: "Finance/Bol.com/Settlement reports/2026", status: "confirmed", coverage: 100, note: "All three net settlement amounts matched to bank receipts." },

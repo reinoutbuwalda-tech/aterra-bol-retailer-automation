@@ -7,6 +7,7 @@ import type { FinanceException, EvidenceSource } from "@/lib/benchmark";
 type State = {
   entity: { legalName: string; tradingName: string; legalForm: string; kvk: string; rsin: string; vatId: string; vatIdStatus: string };
   period: string;
+  revenuePeriods: { id: string; label: string; scope: string; revenueExVat: number; revenueIncVat: number; sales: number; orders: number; visits: number | null; performance: { day: string; revenue: number }[] }[];
   metrics: { label: string; value: string; status: string; note: string }[];
   performance: { day: string; revenue: number }[];
   pnl: { label: string; amount: string; state: string }[];
@@ -30,21 +31,23 @@ function Euro({ value }: { value: number }) { return <>{new Intl.NumberFormat("e
 
 export default function ControlRoom({ actor, initialState }: { actor: Actor; initialState: State }) {
   const [view, setView] = useState<View>("Overview");
+  const [periodId, setPeriodId] = useState("may");
   const [exceptions, setExceptions] = useState(initialState.exceptions);
   const [evidence, setEvidence] = useState<EvidenceSource | null>(null);
   const [resolving, setResolving] = useState<string | null>(null);
-  const max = Math.max(...initialState.performance.map(p => p.revenue));
+  const revenuePeriod = initialState.revenuePeriods.find(period => period.id === periodId) ?? initialState.revenuePeriods[0];
+  const max = Math.max(...revenuePeriod.performance.map(p => p.revenue));
   const openCount = exceptions.filter(e => e.status === "open").length;
   const confirmedCoverage = Math.round(initialState.sources.reduce((sum, source) => sum + source.coverage, 0) / initialState.sources.length);
   const canEdit = actor.role !== "architect";
   const viewSubtitle = useMemo(() => ({
-    Overview: "A release-gated view of the May financial position.",
+    Overview: `A release-gated view of the ${revenuePeriod.label} financial position.`,
     "May close": "A controlled route from captured evidence to accountant-approved output.",
     Reconciliations: "Deterministic matching from source report to bank receipt.",
     Evidence: "Every number remains connected to its source and transformation history.",
     Exceptions: "Issues are quarantined until a named human resolves them.",
     Controls: "Access, approvals and accounting policy gates.",
-  }[view]), [view]);
+  }[view]), [view, revenuePeriod.label]);
 
   async function resolve(item: FinanceException) {
     const resolution = window.prompt(`Resolution for ${item.id}:`, "Reviewed against source evidence; correction approved.");
@@ -64,16 +67,21 @@ export default function ControlRoom({ actor, initialState }: { actor: Actor; ini
       <div className="user-card"><div>{actor.name.slice(0, 1).toUpperCase()}</div><p><strong>{actor.name}</strong><span>{actor.role}</span></p></div>
     </aside>
     <main className="workspace">
-      <header><div><span className="eyebrow">Financial control room · {initialState.period}</span><h1>{view}</h1><p>{viewSubtitle}</p></div><div className="header-actions"><span className="live-dot">Evidence connected</span><button className="period">May 2026⌄</button></div></header>
+      <header><div><span className="eyebrow">Financial control room · {revenuePeriod.label}</span><h1>{view}</h1><p>{viewSubtitle}</p></div><div className="header-actions"><span className="live-dot">Evidence connected</span><label className="period"><span>Reporting period</span><select value={periodId} onChange={event => setPeriodId(event.target.value)}>{initialState.revenuePeriods.map(period => <option value={period.id} key={period.id}>{period.label}</option>)}</select></label></div></header>
 
       {view === "Overview" && <>
-        <section className="metric-grid">{initialState.metrics.map(metric => <article className={`metric ${metric.status}`} key={metric.label}><div><span>{metric.label}</span><StatusPill status={metric.status} /></div><strong>{metric.value}</strong><p>{metric.note}</p></article>)}</section>
+        <section className="reporting-scope"><div><span className="eyebrow">Selected reporting scope</span><strong>{revenuePeriod.scope}</strong></div><p>Bol order revenue is shown excluding BTW for the P&amp;L. Refunds, cancellations and credit notes remain separate reversals until confirmed.</p></section>
+        <section className="metric-grid">
+          <article className="metric provisional"><div><span>Bol order revenue · excl. BTW</span><StatusPill status="provisional" /></div><strong><Euro value={revenuePeriod.revenueExVat}/></strong><p>{revenuePeriod.sales} sales · {revenuePeriod.orders} orders · before confirmed reversals</p></article>
+          <article className="metric provisional"><div><span>Customer sales value · incl. BTW</span><StatusPill status="provisional" /></div><strong><Euro value={revenuePeriod.revenueIncVat}/></strong><p>Presentation value only · not P&amp;L revenue</p></article>
+          {initialState.metrics.slice(1).map(metric => <article className={`metric ${metric.status}`} key={metric.label}><div><span>{metric.label}</span><StatusPill status={metric.status} /></div><strong>{metric.value}</strong><p>{metric.note}</p></article>)}
+        </section>
         <section className="two-column">
-          <article className="panel chart-panel"><div className="panel-head"><div><span className="eyebrow">Commercial signal</span><h2>Bol revenue progression</h2></div><button onClick={() => setEvidence(initialState.sources[1])}>View source ↗</button></div><div className="chart"><div className="axis"><span>€650</span><span>€0</span></div>{initialState.performance.map(point => <div className="bar-wrap" key={point.day}><div className="bar-value">€{point.revenue}</div><div className="bar" style={{ height: `${Math.round((point.revenue / max) * 100)}%` }} /><span>{point.day}</span></div>)}</div><p className="chart-note">Reported sales only. Recognition stays provisional until returns, fees and period rules are approved.</p></article>
+          <article className="panel chart-panel"><div className="panel-head"><div><span className="eyebrow">Commercial signal · excluding BTW</span><h2>Bol revenue progression</h2></div><button onClick={() => setEvidence(initialState.sources[1])}>View source ↗</button></div><div className="chart"><div className="axis"><span><Euro value={max}/></span><span>€0</span></div>{revenuePeriod.performance.map(point => <div className="bar-wrap" key={point.day}><div className="bar-value"><Euro value={point.revenue}/></div><div className="bar" style={{ height: `${Math.round((point.revenue / max) * 100)}%` }} /><span>{point.day}</span></div>)}</div><p className="chart-note">Reported Bol order revenue before confirmed cancellations, refunds and credit notes. Overlapping 14-day exports are deduplicated by date + EAN.</p></article>
           <article className="panel readiness"><div className="panel-head"><div><span className="eyebrow">May close</span><h2>Release readiness</h2></div><strong>58%</strong></div><div className="progress"><i style={{ width: "58%" }} /></div>{[{n:"Sales completeness",s:"confirmed"},{n:"Bank completeness",s:"confirmed"},{n:"Fees & refunds",s:"provisional"},{n:"COGS & inventory",s:"blocked"},{n:"BTW evidence",s:"blocked"}].map(x => <div className="check-row" key={x.n}><span>{x.n}</span><StatusPill status={x.s}/></div>)}<button className="primary" onClick={() => setView("Exceptions")}>Review {openCount} blocking items</button></article>
         </section>
         <section className="two-column lower">
-          <article className="panel"><div className="panel-head"><div><span className="eyebrow">Provisional P&amp;L</span><h2>May result bridge</h2></div><span className="lock">Policy-gated</span></div><div className="pnl-table">{initialState.pnl.map(row => <div key={row.label}><span>{row.label}</span><strong className={row.state}>{row.amount}</strong></div>)}</div></article>
+          <article className="panel"><div className="panel-head"><div><span className="eyebrow">Provisional P&amp;L · {revenuePeriod.label}</span><h2>Revenue-to-result bridge</h2></div><span className="lock">Policy-gated</span></div><div className="pnl-table"><div><span>Marketplace order revenue · excl. BTW</span><strong className="provisional"><Euro value={revenuePeriod.revenueExVat}/></strong></div>{initialState.pnl.slice(1).map(row => <div key={row.label}><span>{row.label}</span><strong className={row.state}>{row.amount}</strong></div>)}</div></article>
           <article className="panel"><div className="panel-head"><div><span className="eyebrow">Source coverage</span><h2>Evidence health</h2></div><strong>{confirmedCoverage}%</strong></div>{initialState.sources.slice(0,5).map(source => <button className="source-row" key={source.id} onClick={() => setEvidence(source)}><span className="source-icon">{source.provider.slice(0,2).toUpperCase()}</span><p><strong>{source.name}</strong><span>{source.provider} · {source.period}</span></p><div className="mini-progress"><i style={{width:`${source.coverage}%`}} /></div><b>{source.coverage}%</b></button>)}<button className="text-button" onClick={() => setView("Evidence")}>Open evidence registry →</button></article>
         </section>
       </>}

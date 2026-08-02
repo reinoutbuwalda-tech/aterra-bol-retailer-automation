@@ -3,11 +3,12 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("ships the financial control room and removes the starter", async () => {
-  const [ui, benchmark, layout, css] = await Promise.all([
+  const [ui, benchmark, layout, css, revenueCss] = await Promise.all([
     readFile(new URL("../app/control-room.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/benchmark.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../app/revenue-period.css", import.meta.url), "utf8"),
   ]);
   assert.match(layout, /Aterra Financial Control Room/);
   assert.match(ui, /Bol revenue progression/);
@@ -17,7 +18,12 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(ui, /Opening to current inventory/);
   assert.match(ui, /Bol orders → revenue/);
   assert.match(ui, /All ten policy proposals approved/);
+  assert.match(ui, /Reporting period/);
+  assert.match(ui, /Customer sales value · incl\. BTW/);
+  assert.match(ui, /Refunds, cancellations and credit notes remain separate reversals/);
   assert.match(benchmark, /€3,001\.69/);
+  assert.match(benchmark, /revenueExVat: 5210\.96/);
+  assert.match(benchmark, /revenueIncVat: 6305\.26/);
   assert.match(benchmark, /Treso ONO/);
   assert.match(benchmark, /NL868817375B01/);
   assert.match(benchmark, /owner-confirmed/);
@@ -28,6 +34,7 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(benchmark, /owner-approved/);
   assert.match(benchmark, /not the BTW reserve/i);
   assert.match(css, /--forest:#4a6741/);
+  assert.match(revenueCss, /reporting-scope/);
   assert.doesNotMatch(ui + layout, /Starter Project|react-loading-skeleton/);
 });
 
