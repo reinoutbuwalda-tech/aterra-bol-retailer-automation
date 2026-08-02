@@ -12,8 +12,13 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(layout, /Aterra Financial Control Room/);
   assert.match(ui, /Bol revenue progression/);
   assert.match(ui, /Traceability chain/);
+  assert.match(ui, /Captured BTW lines/);
+  assert.match(ui, /Two VAT IDs found/);
   assert.match(benchmark, /€3,001\.69/);
   assert.match(benchmark, /Treso ONO/);
+  assert.match(benchmark, /NL868817375B01/);
+  assert.match(benchmark, /NL005313044B88/);
+  assert.match(benchmark, /not the BTW reserve/i);
   assert.match(css, /--forest:#4a6741/);
   assert.doesNotMatch(ui + layout, /Starter Project|react-loading-skeleton/);
 });
