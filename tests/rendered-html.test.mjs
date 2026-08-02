@@ -16,6 +16,7 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(ui, /Operating model/);
   assert.match(ui, /Opening to current inventory/);
   assert.match(ui, /Bol orders → revenue/);
+  assert.match(ui, /All ten policy proposals approved/);
   assert.match(benchmark, /€3,001\.69/);
   assert.match(benchmark, /Treso ONO/);
   assert.match(benchmark, /NL868817375B01/);
@@ -23,6 +24,8 @@ test("ships the financial control room and removes the starter", async () => {
   assert.match(benchmark, /Fruit-infuser carafe/);
   assert.match(benchmark, /current: 195/);
   assert.match(benchmark, /order date/);
+  assert.match(benchmark, /POL-01 through POL-10/);
+  assert.match(benchmark, /owner-approved/);
   assert.match(benchmark, /not the BTW reserve/i);
   assert.match(css, /--forest:#4a6741/);
   assert.doesNotMatch(ui + layout, /Starter Project|react-loading-skeleton/);

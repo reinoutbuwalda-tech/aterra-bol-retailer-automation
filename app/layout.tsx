@@ -3,6 +3,7 @@ import "./globals.css";
 import "./close.css";
 import "./identity.css";
 import "./inventory.css";
+import "./policy-approval.css";
 
 export const metadata: Metadata = {
   title: "Aterra Financial Control Room",

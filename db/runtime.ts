@@ -39,6 +39,10 @@ async function ensureSchema(db: RawDb) {
     await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
       .bind(id, "reinout.buwalda@gmail.com", "owner.decision.confirm", objectType, objectId, JSON.stringify(payload), decisionTime).run();
   }
+  await db.prepare("UPDATE exceptions SET title=?, detail=?, owner='Accountant', updated_at=? WHERE id='EX-005' AND status='open'")
+    .bind("Accounting policy accountant countersignature pending", "Reinout approved all ten policy proposals on 2 August 2026. Accountant countersignature is still required before activation for closed reporting and BTW.", decisionTime).run();
+  await db.prepare("INSERT OR IGNORE INTO audit_events (id,actor_email,action,object_type,object_id,after_json,occurred_at) VALUES (?,?,?,?,?,?,?)")
+    .bind("decision-policy-package-owner-approval-2026-08-02", "reinout.buwalda@gmail.com", "accounting_policy.owner_approve", "accounting_policy_set", "POL-01-POL-10", JSON.stringify({ status: "owner-approved", policies: ["POL-01","POL-02","POL-03","POL-04","POL-05","POL-06","POL-07","POL-08","POL-09","POL-10"], nextGate: "Dutch-accountant countersignature" }), decisionTime).run();
 }
 
 export async function getControlRoomState() {
