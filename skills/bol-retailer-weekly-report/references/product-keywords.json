@@ -1,0 +1,29 @@
+{
+  "locales": ["nl-NL", "nl-BE", "fr-BE"],
+  "products": {
+    "8720892887504": {
+      "shortName": "Water Karaf",
+      "primaryKeyword": "waterkaraf",
+      "secondaryKeywords": ["karaf", "waterkan", "glazen karaf"],
+      "strategicKeywords": ["waterkaraf glas", "karaf met dop"]
+    },
+    "8720892887511": {
+      "shortName": "Stainless Steel Waterkan",
+      "primaryKeyword": "waterkaraf",
+      "secondaryKeywords": ["kan", "karaf", "waterkan"],
+      "strategicKeywords": ["waterkan rvs", "rvs karaf"]
+    },
+    "8720892887528": {
+      "shortName": "XL Sporttas",
+      "primaryKeyword": "sporttas",
+      "secondaryKeywords": ["gymtas", "sporttas dames", "sporttas met schoenenvak"],
+      "strategicKeywords": ["reistas sporttas", "sporttas heren", "voetbaltas kinderen"]
+    },
+    "6970452112658": {
+      "shortName": "Besrey Fort Kit",
+      "primaryKeyword": "hut bouwen",
+      "secondaryKeywords": ["speeltent", "bouwpakket kinderen"],
+      "strategicKeywords": ["fort bouwen", "hut bouwen kinderen"]
+    }
+  }
+}

@@ -166,18 +166,7 @@ async function exchangeAuthorizationCode(code: string, origin: string) {
 
 async function refreshAccessToken(connection: GoogleConnection) {
   if (!connection.encrypted_refresh_token) throw new Error("Google refresh token is unavailable; reconnect Aterra Gmail.");
-  const response = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: decryptToken(connection.encrypted_refresh_token),
-      client_id: requireEnvironment("GOOGLE_CLIENT_ID"),
-      client_secret: requireEnvironment("GOOGLE_CLIENT_SECRET"),
-      grant_type: "refresh_token",
-    }),
-  });
-  if (!response.ok) throw new Error(`Google token refresh failed (${response.status}).`);
-  const tokens = await response.json() as TokenResponse;
+  const tokens = await refreshGoogleAccessToken(connection.encrypted_refresh_token);
   const db = getSupabaseAdmin();
   if (!db) throw new Error("Supabase is not configured.");
   const expiresAt = new Date(Date.now() + (tokens.expires_in || 3600) * 1000).toISOString();
@@ -190,6 +179,22 @@ async function refreshAccessToken(connection: GoogleConnection) {
   }).eq("id", connection.id);
   if (error) throw error;
   return tokens.access_token;
+}
+
+export async function refreshGoogleAccessToken(encryptedRefreshToken: string) {
+  const response = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      refresh_token: decryptToken(encryptedRefreshToken),
+      client_id: requireEnvironment("GOOGLE_CLIENT_ID"),
+      client_secret: requireEnvironment("GOOGLE_CLIENT_SECRET"),
+      grant_type: "refresh_token",
+    }),
+  });
+  if (!response.ok) throw new Error(`Google token refresh failed (${response.status}).`);
+  const tokens = await response.json() as TokenResponse;
+  return tokens;
 }
 
 async function getConnection() {

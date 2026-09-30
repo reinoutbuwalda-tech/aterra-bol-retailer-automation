@@ -1,0 +1,21 @@
+{
+  "locales": ["nl-NL", "nl-BE", "fr-BE"],
+  "products": {
+    "8720892887504": {
+      "shortName": "Water Karaf",
+      "primaryKeyword": "waterkaraf"
+    },
+    "8720892887511": {
+      "shortName": "Stainless Steel Waterkan",
+      "primaryKeyword": "waterkaraf"
+    },
+    "8720892887528": {
+      "shortName": "XL Sporttas",
+      "primaryKeyword": "sporttas"
+    },
+    "6970452112658": {
+      "shortName": "Besrey Fort Kit",
+      "primaryKeyword": "hut bouwen"
+    }
+  }
+}
