@@ -5,11 +5,158 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const source = readFileSync(new URL('../supabase/functions/bol-retailer-transform/index.ts', import.meta.url), 'utf8');
-const fixture = JSON.parse(readFileSync(new URL('../docs/bol-retailer-api-2026-W39-snapshot-2026-09-28.json', import.meta.url), 'utf8'));
 const legacyPromotionMigration = readFileSync(
   new URL('../supabase/migrations/20260929163859_promote_verified_legacy_retailer_insights.sql', import.meta.url),
   'utf8',
 );
+
+const weekDates = [
+  '2026-09-21', '2026-09-22', '2026-09-23', '2026-09-24',
+  '2026-09-25', '2026-09-26', '2026-09-27',
+];
+const rankLocales = ['fr-BE', 'nl-BE', 'nl-NL'];
+const products = [
+  {
+    ean: '6970452112658', offerId: 'offer-fort', title: 'Fort kit',
+    units: 1, unitPrice: 59.99, commission: 10.15, visits: [4, 6, 3, 8, 6, 3, 4],
+  },
+  {
+    ean: '8720892887504', offerId: 'offer-fruit-carafe', title: 'Fruit carafe',
+    units: 4, unitPrice: 27.99, commission: 21.4, visits: [14, 6, 6, 7, 11, 10, 13],
+  },
+  {
+    ean: '8720892887511', offerId: 'offer-steel-carafe', title: 'Steel carafe',
+    units: 7, unitPrice: 206.93 / 7, commission: 39.1, visits: [15, 14, 9, 16, 11, 14, 13],
+  },
+  {
+    ean: '8720892887528', offerId: 'offer-sports-bag', title: 'Sports bag 54L',
+    units: 11, unitPrice: 390.89 / 11, commission: 63.48, visits: [20, 26, 23, 24, 14, 13, 25],
+  },
+];
+
+function dateParts(date) {
+  const [year, month, day] = date.split('-').map(Number);
+  return { year, month, day };
+}
+
+function buildFixture() {
+  const shipments = products.map((product, index) => {
+    const shipmentId = `shipment-${index + 1}`;
+    const orderId = `order-${index + 1}`;
+    return {
+      status: 200,
+      shipmentId,
+      detail: {
+        shipmentId,
+        shipmentDateTime: `${weekDates[index]}T12:00:00+02:00`,
+        order: { orderId },
+        pickupPoint: false,
+        shipmentDetails: { countryCode: 'NL' },
+        billingDetails: { countryCode: 'NL' },
+        transport: {},
+        shipmentItems: [{
+          orderItemId: `order-item-${index + 1}`,
+          product: { ean: product.ean, title: product.title },
+          offer: { offerId: product.offerId },
+          fulfilment: { method: 'FBR', distributionParty: 'RETAILER' },
+          quantityShipped: product.units,
+          unitPrice: product.unitPrice,
+          commission: product.commission,
+        }],
+      },
+    };
+  });
+  const offers = products.map(product => ({
+    offerId: product.offerId,
+    ean: product.ean,
+    lastModifiedDateTime: '2026-09-27T12:00:00+02:00',
+    onHoldByRetailer: false,
+    condition: { category: 'NEW' },
+    product: { bolProductId: `bol-${product.ean}` },
+    stock: { amount: 100, correctedStock: 100, managedByRetailer: true },
+    pricing: { bundlePrices: [{ quantity: 1, unitPrice: product.unitPrice }] },
+    fulfilment: { method: 'FBR', schedule: 'SHIPPING_VIA_BOL' },
+    countryAvailabilities: [
+      { countryCode: 'NL', forSale: true },
+      { countryCode: 'BE', forSale: true },
+    ],
+  }));
+  const offerInsights = products.flatMap(product => [
+    {
+      ean: product.ean,
+      offerId: product.offerId,
+      metric: 'PRODUCT_VISITS',
+      periods: weekDates.map((date, index) => ({
+        period: dateParts(date),
+        total: product.visits[index],
+        countries: [{ countryCode: 'NL', value: product.visits[index] }],
+      })),
+    },
+    {
+      ean: product.ean,
+      offerId: product.offerId,
+      metric: 'BUY_BOX_PERCENTAGE',
+      periods: weekDates.map(date => ({
+        period: dateParts(date),
+        countries: [
+          { countryCode: 'NL', value: 100 },
+          { countryCode: 'BE', value: 90 },
+        ],
+      })),
+    },
+  ]);
+  const ranks = products.flatMap(product => weekDates.flatMap(date => rankLocales.map(locale => ({
+    status: 200,
+    ean: product.ean,
+    date,
+    locale,
+    type: 'SEARCH',
+    data: { ranks: [{ searchTerm: product.title.toLowerCase(), rank: 1, impressions: 1, wasSponsored: false }] },
+  }))));
+
+  return {
+    generatedAt: '2026-09-28T08:00:00+02:00',
+    summary: { fixture: 'synthetic W39 reconciliation case' },
+    operational: {
+      shipmentDetails: shipments,
+      ordersFromShipmentDetails: [],
+      returns: [
+        {
+          returnId: 'return-unmatched-fort',
+          registrationDateTime: '2026-09-27T12:05:18+02:00',
+          fulfilmentMethod: 'FBR',
+          returnItems: [{
+            rmaId: 'rma-unmatched-fort',
+            orderId: 'order-outside-week',
+            ean: '6970452112658',
+            expectedQuantity: 1,
+            handled: false,
+            returnReason: { mainReason: 'Ordered by mistake', customerComments: 'Perongeluk' },
+          }],
+        },
+        {
+          returnId: 'return-linked-carafe',
+          registrationDateTime: '2026-09-23T20:21:01+02:00',
+          fulfilmentMethod: 'FBR',
+          returnItems: [{
+            rmaId: 'rma-linked-carafe',
+            orderId: 'order-2',
+            ean: '8720892887504',
+            expectedQuantity: 1,
+            handled: false,
+            returnReason: { mainReason: 'Quality' },
+          }],
+        },
+      ],
+      unhandledReturns: [],
+    },
+    currentState: { offers, inventory: [], commissions: [] },
+    weekMetrics: { offerInsights },
+    additionalReadOnlySurfaces: { productRanks: ranks },
+  };
+}
+
+const fixture = buildFixture();
 
 function transformer() {
   const context = vm.createContext({
