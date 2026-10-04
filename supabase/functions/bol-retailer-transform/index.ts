@@ -1,8 +1,11 @@
 import { createClient } from "npm:@supabase/supabase-js@2.111.0";
 
-const TRANSFORM_VERSION = "retailer-transform-v1";
+const TRANSFORM_VERSION = "retailer-transform-v2";
 const SOURCE_CONTRACT_VERSION = "3.0";
 const EXPECTED_ARTIFACTS = ["catalog", "commercial", "financial", "insights", "operations", "provenance"] as const;
+const EXPECTED_DATASETS = ["account", "catalog", "commercial", "financial", "insights", "operations"] as const;
+const TERMINAL_SOURCE_STATUSES = new Set(["complete", "partial"]);
+const DATASET_STATUSES = new Set(["complete", "partial", "not_collected"]);
 const EXPECTED_RANK_LOCALES = new Set(["fr-BE", "nl-BE", "nl-NL"]);
 const BUCKET = "bol-retailer-api-json";
 const MAX_MESSAGES_PER_INVOCATION = 2;
@@ -88,6 +91,10 @@ function record(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 }
 
+function isRecord(value: unknown): value is JsonRecord {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function rows(value: unknown): JsonRecord[] {
   return Array.isArray(value) ? value.filter(item => item && typeof item === "object" && !Array.isArray(item)) as JsonRecord[] : [];
 }
@@ -130,6 +137,25 @@ function isoTimestamp(value: unknown): string | null {
   if (!result) return null;
   const parsed = new Date(result);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function isoWeekParts(start: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return null;
+  const monday = new Date(`${start}T00:00:00.000Z`);
+  if (Number.isNaN(monday.getTime()) || monday.getUTCDay() !== 1) return null;
+  const thursday = new Date(monday);
+  thursday.setUTCDate(thursday.getUTCDate() + 3);
+  const yearStart = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+  const isoWeek = Math.ceil((((thursday.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  const isoYear = thursday.getUTCFullYear();
+  return { isoYear, isoWeek, label: `${isoYear}-W${String(isoWeek).padStart(2, "0")}` };
+}
+
+function addUtcDays(date: string, days: number) {
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
 }
 
 function periodDate(value: JsonRecord): string | null {
@@ -245,20 +271,92 @@ function assertContract(condition: unknown, code: string, message: string): asse
   if (!condition) throw new PermanentTransformError(code, message);
 }
 
+function validateDatasetStatusContract(value: unknown) {
+  assertContract(isRecord(value), "INVALID_DATASET_STATUSES", "Manifest datasetStatuses must be an object.");
+  const statuses = value as JsonRecord;
+  const names = Object.keys(statuses).sort();
+  assertContract(
+    stableStringify(names) === stableStringify([...EXPECTED_DATASETS].sort()),
+    "DATASET_STATUS_SET_MISMATCH",
+    `Manifest must describe exactly ${EXPECTED_DATASETS.length} source datasets.`,
+  );
+
+  for (const dataset of EXPECTED_DATASETS) {
+    const detailValue = statuses[dataset];
+    assertContract(isRecord(detailValue), "INVALID_DATASET_STATUS", `Dataset ${dataset} has no status detail.`);
+    const detail = detailValue as JsonRecord;
+    const status = text(detail.status);
+    assertContract(DATASET_STATUSES.has(status), "INVALID_DATASET_STATUS", `Dataset ${dataset} has unsupported status ${status || "empty"}.`);
+    const counts = ["calls", "errors", "unavailable", "rows"].map(field => detail[field]);
+    assertContract(
+      counts.every(count => typeof count === "number" && Number.isInteger(count) && count >= 0),
+      "INVALID_DATASET_STATUS",
+      `Dataset ${dataset} must contain nonnegative integer calls, errors, unavailable, and rows.`,
+    );
+    const calls = detail.calls as number;
+    const errors = detail.errors as number;
+    const unavailable = detail.unavailable as number;
+    const rowCount = detail.rows as number;
+    assertContract(errors + unavailable <= calls, "INVALID_DATASET_STATUS", `Dataset ${dataset} reports more outcomes than calls.`);
+    assertContract(status !== "complete" || errors === 0, "INVALID_DATASET_STATUS", `Complete dataset ${dataset} cannot contain errors.`);
+    assertContract(status === "not_collected" ? calls === 0 && errors === 0 && unavailable === 0 && rowCount === 0 : calls > 0, "INVALID_DATASET_STATUS", `Dataset ${dataset} counts do not agree with status ${status}.`);
+  }
+  return statuses;
+}
+
+function validateManifestContract(manifest: JsonRecord, claim: Claim) {
+  const week = record(manifest.week);
+  const manifestStatus = text(manifest.status);
+  const generatedAt = text(manifest.generatedAt);
+  const expectedWeek = isoWeekParts(claim.periodStart);
+  const expectedManifestPath = `retailer-api/year=${claim.isoYear}/week=${String(claim.isoWeek).padStart(2, "0")}/run=${claim.sourceRunId}/manifest.json`;
+
+  assertContract(claim.sourceContractVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Claimed source contract ${claim.sourceContractVersion} is not supported.`);
+  assertContract(manifest.schemaVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Source contract ${text(manifest.schemaVersion)} is not supported.`);
+  assertContract(manifest.runId === claim.sourceRunId, "MANIFEST_RUN_MISMATCH", "Manifest run ID does not match the claimed source run.");
+  assertContract(claim.manifestPath === expectedManifestPath, "MANIFEST_PATH_MISMATCH", "Manifest path does not match the claimed year, week, and source run.");
+  assertContract(TERMINAL_SOURCE_STATUSES.has(manifestStatus), "SOURCE_NOT_TERMINAL", "Manifest does not contain a terminal source status.");
+  assertContract(manifestStatus === claim.sourceStatus, "SOURCE_STATUS_MISMATCH", "Manifest status does not match the authoritative source run status.");
+  assertContract(expectedWeek && expectedWeek.isoYear === claim.isoYear && expectedWeek.isoWeek === claim.isoWeek, "CLAIM_WEEK_MISMATCH", "Claimed ISO year and week do not match the claimed Monday.");
+  assertContract(week.label === expectedWeek?.label && week.start === claim.periodStart && week.end === claim.periodEnd && addUtcDays(claim.periodStart, 6) === claim.periodEnd, "MANIFEST_WEEK_MISMATCH", "Manifest week does not match the claimed complete ISO week.");
+  assertContract(/^\d{4}-\d{2}-\d{2}T/.test(generatedAt) && isoTimestamp(generatedAt), "INVALID_MANIFEST_GENERATED_AT", "Manifest generatedAt must be a valid timestamp.");
+  assertContract(isRecord(manifest.summary), "INVALID_MANIFEST_SUMMARY", "Manifest summary must be an object.");
+  assertContract(isRecord(manifest.completeness), "INVALID_MANIFEST_COMPLETENESS", "Manifest completeness must be an object.");
+  assertContract(Array.isArray(manifest.warnings) && manifest.warnings.every(value => typeof value === "string"), "INVALID_MANIFEST_WARNINGS", "Manifest warnings must be an array of strings.");
+  validateDatasetStatusContract(manifest.datasetStatuses);
+
+  const manifestArtifacts = rows(manifest.artifacts);
+  const names = manifestArtifacts.map(item => text(item.name)).sort();
+  assertContract(stableStringify(names) === stableStringify([...EXPECTED_ARTIFACTS].sort()), "ARTIFACT_SET_MISMATCH", `Expected ${EXPECTED_ARTIFACTS.length} named artifacts.`);
+  const basePath = expectedManifestPath.slice(0, expectedManifestPath.lastIndexOf("/"));
+  for (const descriptor of manifestArtifacts) {
+    const name = text(descriptor.name);
+    assertContract(text(descriptor.path) === `${basePath}/${name}.json`, "ARTIFACT_PATH_MISMATCH", `${name}.json does not use the exact claimed run path.`);
+    assertContract(/^[0-9a-f]{64}$/.test(text(descriptor.sha256)), "INVALID_ARTIFACT_HASH", `${name}.json has an invalid manifest hash.`);
+    assertContract(typeof descriptor.bytes === "number" && Number.isInteger(descriptor.bytes) && descriptor.bytes > 0, "INVALID_ARTIFACT_SIZE", `${name}.json must be a nonempty stored artifact.`);
+  }
+  return manifestArtifacts;
+}
+
+function validateArtifactEnvelope(name: string, artifact: JsonRecord, manifest: JsonRecord) {
+  assertContract(stableStringify(record(artifact.week)) === stableStringify(record(manifest.week)), "ARTIFACT_WEEK_MISMATCH", `${name}.json week does not match the manifest.`);
+  assertContract(artifact.generatedAt === manifest.generatedAt, "ARTIFACT_GENERATED_AT_MISMATCH", `${name}.json generatedAt does not match the manifest.`);
+  if (name === "commercial") assertContract(isRecord(artifact.operational), "INVALID_COMMERCIAL_ARTIFACT", "commercial.json has no operational object.");
+  if (name === "catalog") assertContract(isRecord(artifact.currentState), "INVALID_CATALOG_ARTIFACT", "catalog.json has no currentState object.");
+  if (name === "insights") assertContract(isRecord(artifact.weekMetrics) && Array.isArray(artifact.ranks), "INVALID_INSIGHTS_ARTIFACT", "insights.json has no weekMetrics object or ranks array.");
+  if (name === "financial") assertContract(isRecord(artifact.settlement), "INVALID_FINANCIAL_ARTIFACT", "financial.json has no settlement object.");
+  if (name === "provenance") {
+    assertContract(isRecord(artifact.summary) && isRecord(artifact.completeness) && Array.isArray(artifact.calls), "INVALID_PROVENANCE_ARTIFACT", "provenance.json is missing its summary, completeness, or calls.");
+    assertContract(stableStringify(artifact.datasetStatuses) === stableStringify(manifest.datasetStatuses), "PROVENANCE_STATUS_MISMATCH", "provenance.json dataset statuses do not match the manifest.");
+  }
+}
+
 async function loadVerifiedPackage(supabase: SupabaseClient, claim: Claim) {
   assertContract(claim.storageBucket === BUCKET, "UNEXPECTED_BUCKET", `Expected ${BUCKET}, received ${claim.storageBucket}.`);
   const manifestObject = await downloadObject(supabase, claim.storageBucket, claim.manifestPath);
   assertContract(manifestObject.sha256 === claim.manifestSha256, "MANIFEST_HASH_MISMATCH", "Manifest hash does not match the source run log.");
   const manifest = parseJson(manifestObject.text, "manifest.json");
-  const week = record(manifest.week);
-  assertContract(manifest.schemaVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Source contract ${text(manifest.schemaVersion)} is not supported.`);
-  assertContract(manifest.runId === claim.sourceRunId, "MANIFEST_RUN_MISMATCH", "Manifest run ID does not match the claimed source run.");
-  assertContract(week.start === claim.periodStart && week.end === claim.periodEnd, "MANIFEST_WEEK_MISMATCH", "Manifest period does not match the claimed ISO week.");
-  assertContract(["complete", "partial"].includes(text(manifest.status)), "SOURCE_NOT_TERMINAL", "Manifest does not contain a terminal source status.");
-
-  const manifestArtifacts = rows(manifest.artifacts);
-  const names = manifestArtifacts.map(item => text(item.name)).sort();
-  assertContract(JSON.stringify(names) === JSON.stringify([...EXPECTED_ARTIFACTS].sort()), "ARTIFACT_SET_MISMATCH", `Expected ${EXPECTED_ARTIFACTS.length} named artifacts.`);
+  const manifestArtifacts = validateManifestContract(manifest, claim);
   assertContract(claim.sourceArtifactCount === EXPECTED_ARTIFACTS.length + 1, "ARTIFACT_COUNT_MISMATCH", "Source run log does not report exactly seven artifacts.");
 
   const basePath = claim.manifestPath.slice(0, claim.manifestPath.lastIndexOf("/"));
@@ -282,13 +380,17 @@ async function loadVerifiedPackage(supabase: SupabaseClient, claim: Claim) {
     const path = text(descriptor.path);
     const expectedHash = text(descriptor.sha256);
     const expectedBytes = integer(descriptor.bytes, -1);
-    assertContract(path.startsWith(`${basePath}/`) && path.endsWith(`/${name}.json`), "ARTIFACT_PATH_MISMATCH", `${name}.json is outside the claimed run folder.`);
+    assertContract(path === `${basePath}/${name}.json`, "ARTIFACT_PATH_MISMATCH", `${name}.json does not use the exact claimed run path.`);
     assertContract(/^[0-9a-f]{64}$/.test(expectedHash), "INVALID_ARTIFACT_HASH", `${name}.json has an invalid manifest hash.`);
-    assertContract(expectedBytes >= 0, "INVALID_ARTIFACT_SIZE", `${name}.json has an invalid manifest size.`);
+    assertContract(expectedBytes > 0, "INVALID_ARTIFACT_SIZE", `${name}.json must be a nonempty stored artifact.`);
     const object = await downloadObject(supabase, claim.storageBucket, path);
     assertContract(object.bytes.byteLength === expectedBytes, "ARTIFACT_SIZE_MISMATCH", `${name}.json byte count does not match the manifest.`);
     assertContract(object.sha256 === expectedHash, "ARTIFACT_HASH_MISMATCH", `${name}.json hash does not match the manifest.`);
-    if (name !== "operations") artifacts[name] = parseJson(object.text, `${name}.json`);
+    if (name !== "operations") {
+      const artifact = parseJson(object.text, `${name}.json`);
+      validateArtifactEnvelope(name, artifact, manifest);
+      artifacts[name] = artifact;
+    }
     evidence.push({
       artifact_name: name,
       storage_bucket: claim.storageBucket,
@@ -841,21 +943,28 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }
 
   const commercialStatus = text(record(sourceDatasetStatuses.commercial).status);
+  const catalogStatus = text(record(sourceDatasetStatuses.catalog).status);
   const insightsStatus = text(record(sourceDatasetStatuses.insights).status);
   const financialStatus = text(record(sourceDatasetStatuses.financial).status);
   const shipmentReady = commercialStatus === "complete" && invalidShipmentDetails === 0;
+  const catalogReady = catalogStatus === "complete";
+  const insightsReady = insightsStatus === "complete";
   qualityChecks.push(check("SHIPMENT_DETAILS_VALID", "shipment_facts", "error", shipmentReady ? "passed" : "failed", shipmentReady ? "All shipment details are valid and complete." : "One or more shipment details are missing or invalid.", { datasetStatus: "complete", invalidDetails: 0 }, { datasetStatus: commercialStatus, invalidDetails: invalidShipmentDetails }));
+  qualityChecks.push(check("CATALOG_SOURCE_VALID", "catalog_offers", "error", catalogReady ? "passed" : "failed", catalogReady ? "The complete current-offer catalog defines the weekly product universe." : "The current-offer catalog is incomplete, so catalog-dependent coverage cannot be proven.", { datasetStatus: "complete" }, { datasetStatus: catalogStatus, offerCount: offers.length }));
   qualityChecks.push(check("RETURN_MATCH_COVERAGE", "return_adjusted_trading", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "warning" : "info", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "warning" : "passed", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "Some registered returns remain outside the provisional financial adjustment." : "Every registered return was linked exactly once.", { unmatchedUnits: 0, ambiguousUnits: 0 }, { unmatchedUnits: unmatchedReturnUnits, ambiguousUnits: ambiguousReturnUnits }));
   const expectedRankCalls = offerEans.size * 7 * EXPECTED_RANK_LOCALES.size;
-  const ranksReady = rankCombinations.size === expectedRankCalls && rankCalls.every(row => integer(row.status) === 200);
+  const ranksReady = catalogReady && insightsReady && rankCombinations.size === expectedRankCalls && rankCalls.every(row => integer(row.status) === 200);
   qualityChecks.push(check("RANK_CALL_COVERAGE", "keyword_ranks", "error", ranksReady ? "passed" : "failed", ranksReady ? "All expected EAN/date/locale rank calls are present." : "Rank-call coverage is incomplete.", { combinations: expectedRankCalls }, { combinations: rankCombinations.size, rows: rankCalls.length, sourceDatasetStatus: insightsStatus }));
-  const visitCoverageReady = offers.every(offer => (visitDatesByEan.get(text(offer.ean))?.size || 0) === 7);
-  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every offer has seven product-visit dates." : "At least one offer is missing product-visit dates.", { datesPerOffer: 7 }, Object.fromEntries([...visitDatesByEan].map(([ean, dates]) => [ean, dates.size]))));
-  const buyBoxCoverageReady = offers.every(offer => (buyBoxDatesByEan.get(text(offer.ean))?.size || 0) === 7);
-  qualityChecks.push(check("BUY_BOX_DATE_COVERAGE", "buy_box", "warning", buyBoxCoverageReady ? "passed" : "warning", buyBoxCoverageReady ? "Every offer has seven Buy Box dates." : "At least one offer is missing Buy Box dates; missing countries remain missing rather than zero.", { datesPerOffer: 7 }, Object.fromEntries([...buyBoxDatesByEan].map(([ean, dates]) => [ean, dates.size]))));
+  const weeklyProductEans = [...productMetrics.keys()];
+  const visitCoverageReady = catalogReady && insightsReady && weeklyProductEans.every(ean => (visitDatesByEan.get(ean)?.size || 0) === 7);
+  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every weekly product has seven product-visit dates." : "At least one weekly product is missing product-visit dates or a required source dataset is incomplete.", { datesPerProduct: 7, sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries(weeklyProductEans.map(ean => [ean, visitDatesByEan.get(ean)?.size || 0])) }));
+  const buyBoxInputsReady = catalogReady && insightsReady;
+  const buyBoxCoverageReady = buyBoxInputsReady && offers.every(offer => (buyBoxDatesByEan.get(text(offer.ean))?.size || 0) === 7);
+  const buyBoxResult = !buyBoxInputsReady ? "failed" : buyBoxCoverageReady ? "passed" : "warning";
+  qualityChecks.push(check("BUY_BOX_DATE_COVERAGE", "buy_box", buyBoxInputsReady ? "warning" : "error", buyBoxResult, buyBoxCoverageReady ? "Every current offer has seven Buy Box dates." : "At least one current offer is missing Buy Box dates or a required source dataset is incomplete; missing countries remain missing rather than zero.", { datesPerOffer: 7, sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries([...buyBoxDatesByEan].map(([ean, dates]) => [ean, dates.size])) }));
   const invoicesReady = financialStatus === "complete";
   qualityChecks.push(check("INVOICE_SOURCE_VALID", "invoices", "error", invoicesReady ? "passed" : "failed", invoicesReady ? "Invoice list and requested specifications passed the source contract." : "The financial source dataset is incomplete.", { datasetStatus: "complete" }, { datasetStatus: financialStatus, invoiceCount: invoices.length, transactionCount: facts.invoice_transactions.length }));
-  qualityChecks.push(check("FBB_INVENTORY_APPLICABILITY", "fbb_inventory", "info", fbbOffers > 0 ? "passed" : "not_applicable", fbbOffers > 0 ? "FBB offers exist, so FBB inventory observations are applicable." : "All current offers are FBR; FBB inventory is not applicable.", null, { fbbOffers, totalOffers: offers.length }));
+  qualityChecks.push(check("FBB_INVENTORY_APPLICABILITY", "fbb_inventory", catalogReady ? "info" : "error", !catalogReady ? "failed" : fbbOffers > 0 ? "passed" : "not_applicable", !catalogReady ? "FBB applicability cannot be established because the catalog source is incomplete." : fbbOffers > 0 ? "FBB offers exist, so FBB inventory observations are applicable." : "All current offers are FBR; FBB inventory is not applicable.", null, { catalogDatasetStatus: catalogStatus, fbbOffers, totalOffers: offers.length }));
   const allShipmentCountriesPresent = facts.outbound_shipments.every(row => Boolean(row.country_code));
   qualityChecks.push(check("SHIPMENT_COUNTRY_COVERAGE", "country_split", "warning", allShipmentCountriesPresent ? "passed" : "warning", allShipmentCountriesPresent ? "Every shipment has a country code." : "Country reporting remains limited because at least one shipment has no country code.", { missing: 0 }, { missing: facts.outbound_shipments.filter(row => !row.country_code).length }));
   qualityChecks.push(check("ORDER_COHORT_CONVERSION", "order_cohort_conversion", "info", "not_applicable", "Order-cohort conversion is not produced from same-week visits and shipments.", null, null));
@@ -864,11 +973,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     { data_product: "shipment_facts", status: shipmentReady ? "ready" : "not_ready", limitations: shipmentReady ? [] : ["Shipment source data is incomplete."], is_active: shipmentReady },
     { data_product: "registered_return_events", status: commercialStatus === "complete" ? "ready" : "not_ready", limitations: [], is_active: commercialStatus === "complete" },
     { data_product: "return_adjusted_trading", status: !shipmentReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "ready_with_limits" : "ready", limitations: unmatchedReturnUnits + ambiguousReturnUnits > 0 ? ["Unmatched or ambiguous returns are excluded from the provisional value adjustment."] : [], is_active: shipmentReady },
-    { data_product: "product_visits", status: visitCoverageReady ? "ready" : "not_ready", limitations: visitCoverageReady ? [] : ["Not every offer has seven aligned visit dates."], is_active: visitCoverageReady },
+    { data_product: "catalog_offers", status: catalogReady ? "ready" : "not_ready", limitations: catalogReady ? [] : ["The current-offer catalog source is incomplete."], is_active: catalogReady },
+    { data_product: "product_visits", status: visitCoverageReady ? "ready" : "not_ready", limitations: visitCoverageReady ? [] : ["Not every weekly product has seven aligned visit dates from complete catalog and insights sources."], is_active: visitCoverageReady },
     { data_product: "keyword_ranks", status: ranksReady ? "ready" : "not_ready", limitations: ranksReady ? [] : ["Rank-call coverage is incomplete."], is_active: ranksReady },
-    { data_product: "buy_box", status: buyBoxCoverageReady ? "ready" : "ready_with_limits", limitations: buyBoxCoverageReady ? [] : ["At least one Buy Box date is missing."], is_active: true },
+    { data_product: "buy_box", status: !buyBoxInputsReady ? "not_ready" : buyBoxCoverageReady ? "ready" : "ready_with_limits", limitations: buyBoxCoverageReady ? [] : [buyBoxInputsReady ? "At least one Buy Box date is missing." : "The catalog or insights source is incomplete."], is_active: buyBoxInputsReady },
     { data_product: "invoices", status: invoicesReady ? "ready" : "not_ready", limitations: invoicesReady ? [] : ["The financial source dataset is incomplete."], is_active: invoicesReady },
-    { data_product: "fbb_inventory", status: fbbOffers > 0 ? "ready" : "not_applicable", limitations: fbbOffers > 0 ? [] : ["All current offers use FBR."], is_active: true },
+    { data_product: "fbb_inventory", status: !catalogReady ? "not_ready" : fbbOffers > 0 ? "ready" : "not_applicable", limitations: !catalogReady ? ["The catalog source is incomplete."] : fbbOffers > 0 ? [] : ["All current offers use FBR."], is_active: catalogReady },
     { data_product: "country_split", status: allShipmentCountriesPresent ? "ready" : "ready_with_limits", limitations: allShipmentCountriesPresent ? [] : ["At least one shipment has no country code."], is_active: true },
     { data_product: "order_cohort_conversion", status: "not_ready", limitations: ["Same-week shipped units divided by visits is not cohort conversion."], is_active: false },
     { data_product: "trading_units_per_visit", status: shipmentReady && visitCoverageReady ? "ready_with_limits" : "not_ready", limitations: ["This is a same-week trading proxy, not order-cohort conversion."], is_active: shipmentReady && visitCoverageReady },
@@ -920,16 +1030,16 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       },
     };
   });
-  const reportStatus = !shipmentReady || !visitCoverageReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 || !buyBoxCoverageReady || !allShipmentCountriesPresent ? "ready_with_limits" : "ready";
+  const reportStatus = !shipmentReady || !catalogReady || !visitCoverageReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 || !buyBoxCoverageReady || !allShipmentCountriesPresent ? "ready_with_limits" : "ready";
 
   const completedAt = new Date().toISOString();
   const steps = [
     { step_code: "source_validation", status: "passed", input_count: EXPECTED_ARTIFACTS.length + 1, output_count: loaded.evidence.length, started_at: now, completed_at: completedAt, detail: { sourceContractVersion: SOURCE_CONTRACT_VERSION } },
     { step_code: "commercial", status: shipmentReady ? "passed" : "failed", input_count: shipmentDetails.length + returnRows.length, output_count: facts.outbound_shipment_items.length + facts.return_items.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "catalog", status: "passed", input_count: offers.length, output_count: facts.offer_observations.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "insights", status: visitCoverageReady && ranksReady ? "passed" : "warning", input_count: insightRows.length + rankCalls.length, output_count: facts.offer_insight_daily.length + facts.keyword_rank_daily.length, started_at: now, completed_at: completedAt, detail: {} },
+    { step_code: "catalog", status: catalogReady ? "passed" : "failed", input_count: offers.length, output_count: facts.offer_observations.length, started_at: now, completed_at: completedAt, detail: { sourceDatasetStatus: catalogStatus } },
+    { step_code: "insights", status: !visitCoverageReady || !ranksReady || !buyBoxInputsReady ? "failed" : !buyBoxCoverageReady ? "warning" : "passed", input_count: insightRows.length + rankCalls.length, output_count: facts.offer_insight_daily.length + facts.keyword_rank_daily.length, started_at: now, completed_at: completedAt, detail: { sourceDatasetStatus: insightsStatus } },
     { step_code: "financial", status: invoicesReady ? "passed" : "failed", input_count: invoices.length, output_count: facts.invoice_transactions.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "quality", status: qualityChecks.some(row => row.result === "failed") ? "warning" : qualityChecks.some(row => row.result === "warning") ? "warning" : "passed", input_count: qualityChecks.length, output_count: exceptions.length, started_at: now, completed_at: completedAt, detail: {} },
+    { step_code: "quality", status: qualityChecks.some(row => row.result === "failed") ? "failed" : qualityChecks.some(row => row.result === "warning") ? "warning" : "passed", input_count: qualityChecks.length, output_count: exceptions.length, started_at: now, completed_at: completedAt, detail: {} },
     { step_code: "publication", status: "passed", input_count: Object.values(facts).reduce((sum, value) => sum + value.length, 0), output_count: weeklyMetrics.length, started_at: now, completed_at: completedAt, detail: { atomic: true } },
   ];
 

@@ -1,6 +1,6 @@
 # Retailer cloud extraction operations
 
-Updated: 2026-09-29.
+Updated: 2026-09-30.
 
 ## Scheduled run
 
@@ -14,8 +14,8 @@ The production workflow runs every Monday in three stages:
    JSON artifacts to Google Drive, and generates a native human-readable Google Sheet.
 3. A database trigger queues source contract `3.0` runs for the Supabase transform
    worker. The worker runs every five minutes, independently verifies the manifest and
-   all artifact hashes, and atomically publishes facts, lineage, checks, exceptions,
-   data-product revisions, and weekly reporting revisions.
+   all artifact hashes and semantic envelopes, and atomically publishes facts, lineage,
+   checks, exceptions, data-product revisions, and weekly reporting revisions.
 
 Both stages retry once one hour later. Paired UTC summer/winter jobs use a local
 Amsterdam weekday/hour guard, so only the correct daylight-saving job performs work.
@@ -95,14 +95,43 @@ the JSON backup rather than appearing as extra review tabs.
   and other personal fields are excluded before storage.
 - Gross weekly sales use outbound shipment items, not all order items.
 - Returns change provisional value only after an exact order-ID and EAN match.
-- Weekly visits publish only when every offer has all seven reporting dates. Partial
-  daily visit observations remain queryable but are not exposed as a weekly total.
+- Weekly visits publish only when every EAN in the weekly report has all seven
+  reporting dates and both catalog and insights sources are complete. Partial daily
+  visit observations remain queryable but are not exposed as a weekly total.
 - `operations.json` and the manifest remain evidence rather than business fact tables.
 - A lower-readiness rerun remains an inactive revision and cannot replace a better
   active weekly report. A provisional automated revision cannot replace an accounting-
   approved report.
 - Transient transform failures retry with bounded backoff and become
   `RETRY_EXHAUSTED` after five failed attempts.
+
+## Transform v2 rollout
+
+`retailer-transform-v2` is prepared but must be released in this order so a queue
+message can never be interpreted by the wrong transform semantics:
+
+1. Confirm there are no `queued`, `processing`, or `retry_wait` transform runs and the
+   pgmq queue has no visible or in-flight messages. The migration checks both conditions
+   again and stops without changing anything if either is false.
+2. Deploy the v2 Edge worker. Do not invoke an extraction during this short interval.
+3. Apply `20260930155322_retailer_transform_v2_contract.sql`. The migration refuses to
+   switch versions while a transform run is nonterminal.
+4. The migration changes future enqueue messages to v2 and queues one candidate from
+   the latest contract-3.0 source for each historical ISO week.
+5. Let the five-minute worker process those candidates. Confirm v2 runs are terminal,
+   the queue is empty, and lower-readiness candidates did not replace better active
+   reports.
+6. Compare v1 and v2 revision totals, data-product statuses, quality checks, exceptions,
+   and source-artifact integrity before treating the rollout as complete.
+
+The v2 worker rejects a v1 claim rather than silently applying new rules under an old
+lineage label. Rollback before step 3 is simply redeploying v11. After step 3, rollback
+requires restoring the v1 enqueue function before redeploying v11; already published v2
+revisions remain immutable audit evidence.
+
+Both weekly reports and individual data products keep the strongest usable revision for
+the week. A later `ready_with_limits` data product cannot displace an existing `ready`
+revision, while an equally ready newer revision may become current.
 
 ## Structured foundation
 

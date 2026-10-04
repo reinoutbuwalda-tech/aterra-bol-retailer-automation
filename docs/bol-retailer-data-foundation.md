@@ -1,6 +1,6 @@
 # Bol Retailer data foundation
 
-Updated: 2026-09-29.
+Updated: 2026-09-30.
 
 ## Purpose
 
@@ -19,7 +19,7 @@ Bol Retailer API
   -> seven immutable JSON files in private Storage
   -> source run reaches complete or partial
   -> durable pgmq message
-  -> transform verifies manifest, bytes, and SHA-256 hashes
+  -> transform verifies the claimed run, manifest contract, artifact envelopes, bytes, and SHA-256 hashes
   -> normalized facts plus exact source pointers
   -> independent data-product readiness decisions
   -> immutable weekly report revision
@@ -61,8 +61,8 @@ into business tables unless a field is useful for a business decision or audit.
 
 ### `reporting`: what is currently usable
 
-- `data_product_revisions`: independent readiness for shipments, returns, visits,
-  ranks, Buy Box, invoices, country split, and derived trading metrics.
+- `data_product_revisions`: independent readiness for catalog offers, shipments,
+  returns, visits, ranks, Buy Box, invoices, country split, and derived trading metrics.
 - `weekly_report_revisions`: immutable versions of a weekly report.
 - `weekly_revision_sources`: the exact data-product revisions used by a report.
 - `weekly_product_metrics`: one row for every valid mapped offer, including zero-
@@ -88,7 +88,7 @@ table access; the service role performs controlled pipeline writes.
 | --- | --- |
 | Gross shipped units | Quantity in outbound shipment lines dated in the week. |
 | Gross shipped GMS | Shipped quantity multiplied by shipment-line unit price. |
-| Gross commission | Shipped quantity multiplied by shipment-line commission. |
+| Gross commission | Sum of the commission amount already reported for each shipment line. |
 | Registered returns | Return events registered in the week. |
 | Linked returns | Return quantity matched by exact order ID and EAN to a weekly shipment. |
 | Linked return GMS | Value removed only for linked return quantity. |
@@ -112,6 +112,24 @@ Settlement remains provisional until invoice and accounting reconciliation is ap
 A partial source run does not make every output unusable. For example, shipment facts
 can be ready while visits are not ready. Incomplete visits remain daily evidence; the
 weekly visit total and units-per-visit are `null`, never zero or a partial sum.
+
+Catalog completeness is checked separately. The catalog defines the current offer
+universe, so an incomplete catalog makes catalog offers, visits, ranks, Buy Box, and
+FBB inventory `not_ready`. Visit coverage is checked against every EAN that appears in
+the weekly report, including a product that shipped or returned during the week but is
+no longer in the current-offer list. One missing product therefore cannot hide behind
+otherwise complete current offers.
+
+These stricter rules are labeled `retailer-transform-v2`. Existing `v1` revisions stay
+immutable and traceable. A v2 rollout first deploys the compatible worker while the
+queue is empty, then changes the enqueue trigger, and finally queues only the latest
+contract-3.0 source for each historical week. Existing report-promotion guards keep a
+better active report when a v2 historical candidate has lower readiness.
+
+The same protection applies independently to each data product. A later revision only
+becomes current when it is at least as usable as the current one; for example,
+`ready_with_limits` cannot replace `ready`. The weaker revision is still retained and
+linked to its report for audit.
 
 A later rerun can create a new revision without automatically becoming current. The
 database keeps the existing active report when the new revision has lower readiness.

@@ -181,7 +181,7 @@ function canonicalInput() {
       transformRunId: '00000000-0000-4000-8000-000000000001',
       sourceRunId: '32a6e6ad-9a82-453f-840e-078ae592cfe2',
       sourceContractVersion: '3.0',
-      transformVersion: 'retailer-transform-v1',
+      transformVersion: 'retailer-transform-v2',
       leaseToken: '00000000-0000-4000-8000-000000000002',
       attemptNumber: 1,
       isoYear: 2026,
@@ -216,6 +216,124 @@ function canonicalInput() {
     },
   };
 }
+
+function manifestInput() {
+  const { claim } = canonicalInput();
+  claim.manifestPath = `retailer-api/year=2026/week=39/run=${claim.sourceRunId}/manifest.json`;
+  const datasetStatuses = Object.fromEntries([
+    'account', 'catalog', 'commercial', 'financial', 'insights', 'operations',
+  ].map(name => [name, { status: 'complete', calls: 1, errors: 0, unavailable: 0, rows: 1 }]));
+  const basePath = claim.manifestPath.slice(0, claim.manifestPath.lastIndexOf('/'));
+  const manifest = {
+    schemaVersion: '3.0',
+    runId: claim.sourceRunId,
+    status: 'complete',
+    week: { label: '2026-W39', start: claim.periodStart, end: claim.periodEnd },
+    generatedAt: fixture.generatedAt,
+    datasetStatuses,
+    summary: {},
+    completeness: {},
+    warnings: [],
+    artifacts: ['catalog', 'commercial', 'financial', 'insights', 'operations', 'provenance'].map(name => ({
+      name,
+      path: `${basePath}/${name}.json`,
+      sha256: 'a'.repeat(64),
+      bytes: 1,
+    })),
+  };
+  return { claim, manifest };
+}
+
+function artifactEnvelope(name, manifest) {
+  const shared = { week: structuredClone(manifest.week), generatedAt: manifest.generatedAt };
+  if (name === 'commercial') return { ...shared, operational: {} };
+  if (name === 'catalog') return { ...shared, currentState: {} };
+  if (name === 'insights') return { ...shared, weekMetrics: {}, ranks: [] };
+  if (name === 'financial') return { ...shared, settlement: {} };
+  if (name === 'provenance') return {
+    ...shared,
+    summary: {},
+    completeness: {},
+    datasetStatuses: structuredClone(manifest.datasetStatuses),
+    calls: [],
+  };
+  throw new Error(`Unsupported artifact ${name}`);
+}
+
+test('source manifest must agree exactly with the claimed run', () => {
+  const context = transformer();
+  const { claim, manifest } = manifestInput();
+  assert.equal(context.validateManifestContract(manifest, claim).length, 6);
+
+  const wrongStatus = structuredClone(manifest);
+  wrongStatus.status = 'partial';
+  assert.throws(
+    () => context.validateManifestContract(wrongStatus, claim),
+    error => error.code === 'SOURCE_STATUS_MISMATCH',
+  );
+
+  const wrongWeek = structuredClone(manifest);
+  wrongWeek.week.label = '2026-W38';
+  assert.throws(
+    () => context.validateManifestContract(wrongWeek, claim),
+    error => error.code === 'MANIFEST_WEEK_MISMATCH',
+  );
+
+  const wrongPath = structuredClone(manifest);
+  wrongPath.artifacts[0].path = `${claim.manifestPath.slice(0, claim.manifestPath.lastIndexOf('/'))}/nested/catalog.json`;
+  assert.throws(
+    () => context.validateManifestContract(wrongPath, claim),
+    error => error.code === 'ARTIFACT_PATH_MISMATCH',
+  );
+});
+
+test('manifest dataset statuses have an exact, internally consistent shape', () => {
+  const context = transformer();
+  const { claim, manifest } = manifestInput();
+
+  const missingDataset = structuredClone(manifest);
+  delete missingDataset.datasetStatuses.account;
+  assert.throws(
+    () => context.validateManifestContract(missingDataset, claim),
+    error => error.code === 'DATASET_STATUS_SET_MISMATCH',
+  );
+
+  const impossibleCounts = structuredClone(manifest);
+  impossibleCounts.datasetStatuses.catalog.errors = 2;
+  assert.throws(
+    () => context.validateManifestContract(impossibleCounts, claim),
+    error => error.code === 'INVALID_DATASET_STATUS',
+  );
+
+  const emptyArtifact = structuredClone(manifest);
+  emptyArtifact.artifacts[0].bytes = 0;
+  assert.throws(
+    () => context.validateManifestContract(emptyArtifact, claim),
+    error => error.code === 'INVALID_ARTIFACT_SIZE',
+  );
+});
+
+test('parsed artifact envelopes agree with their manifest', () => {
+  const context = transformer();
+  const { manifest } = manifestInput();
+  for (const name of ['commercial', 'catalog', 'insights', 'financial', 'provenance']) {
+    assert.doesNotThrow(() => context.validateArtifactEnvelope(name, artifactEnvelope(name, manifest), manifest));
+  }
+
+  const wrongGeneratedAt = artifactEnvelope('catalog', manifest);
+  wrongGeneratedAt.generatedAt = '2026-09-29T08:00:00.000Z';
+  assert.throws(
+    () => context.validateArtifactEnvelope('catalog', wrongGeneratedAt, manifest),
+    error => error.code === 'ARTIFACT_GENERATED_AT_MISMATCH',
+  );
+
+  const wrongProvenance = artifactEnvelope('provenance', manifest);
+  wrongProvenance.datasetStatuses.catalog.status = 'partial';
+  assert.throws(
+    () => context.validateArtifactEnvelope('provenance', wrongProvenance, manifest),
+    error => error.code === 'PROVENANCE_STATUS_MISMATCH',
+  );
+});
 
 test('W39 canonical trading metrics reconcile to the reviewed workbook', async () => {
   const context = transformer();
@@ -256,6 +374,44 @@ test('partial visit coverage is retained as evidence but not published as a week
   assert.equal(publication.weeklyReport.metrics.every(row => row.trading_units_per_visit === null), true);
   assert.equal(publication.weeklyReport.metrics.every(row => row.visits_status === 'not_ready'), true);
   assert.equal(publication.facts.offer_insight_daily.some(row => row.metric === 'PRODUCT_VISITS'), true);
+});
+
+test('an incomplete catalog blocks catalog-dependent reporting', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  loaded.manifest.datasetStatuses.catalog.status = 'partial';
+
+  const publication = await context.buildPublication(claim, loaded);
+  const revisions = new Map(publication.dataProductRevisions.map(row => [row.data_product, row]));
+  assert.equal(publication.weeklyReport.status, 'not_ready');
+  assert.equal(revisions.get('catalog_offers').status, 'not_ready');
+  assert.equal(revisions.get('product_visits').status, 'not_ready');
+  assert.equal(revisions.get('keyword_ranks').status, 'not_ready');
+  assert.equal(revisions.get('buy_box').status, 'not_ready');
+  assert.equal(publication.qualityChecks.some(row => row.check_code === 'CATALOG_SOURCE_VALID' && row.result === 'failed'), true);
+  assert.equal(publication.steps.find(row => row.step_code === 'catalog').status, 'failed');
+  assert.equal(publication.steps.find(row => row.step_code === 'quality').status, 'failed');
+});
+
+test('a sold product missing from the current catalog cannot hide missing visits', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const missingEan = '8720892887528';
+  loaded.artifacts.catalog.currentState.offers = loaded.artifacts.catalog.currentState.offers
+    .filter(row => row.ean !== missingEan);
+  loaded.artifacts.insights.weekMetrics.offerInsights = loaded.artifacts.insights.weekMetrics.offerInsights
+    .filter(row => row.ean !== missingEan);
+  loaded.artifacts.insights.ranks = loaded.artifacts.insights.ranks
+    .filter(row => row.ean !== missingEan);
+
+  const publication = await context.buildPublication(claim, loaded);
+  const soldProduct = publication.weeklyReport.metrics.find(row => row.ean === missingEan);
+  assert.ok(soldProduct);
+  assert.equal(soldProduct.gross_shipped_units, 11);
+  assert.equal(soldProduct.product_visits, null);
+  assert.equal(publication.weeklyReport.metrics.every(row => row.product_visits === null), true);
+  assert.equal(publication.weeklyReport.status, 'not_ready');
+  assert.equal(publication.qualityChecks.some(row => row.check_code === 'PRODUCT_VISIT_DATE_COVERAGE' && row.result === 'failed'), true);
 });
 
 test('legacy traffic promotion contains only checksum-backed, date-aligned W37-W39 evidence', () => {
