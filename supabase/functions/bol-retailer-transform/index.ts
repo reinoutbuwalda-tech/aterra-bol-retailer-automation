@@ -1,15 +1,21 @@
-import { createClient } from "npm:@supabase/supabase-js@2.111.0";
+import { createClient, type SupabaseClient as SupabaseJsClient } from "npm:@supabase/supabase-js@2.111.0";
 
-const TRANSFORM_VERSION = "retailer-transform-v1";
+const TRANSFORM_VERSION = "retailer-transform-v2";
 const SOURCE_CONTRACT_VERSION = "3.0";
 const EXPECTED_ARTIFACTS = ["catalog", "commercial", "financial", "insights", "operations", "provenance"] as const;
+const EXPECTED_DATASETS = ["account", "catalog", "commercial", "financial", "insights", "operations"] as const;
+const TERMINAL_SOURCE_STATUSES = new Set(["complete", "partial"]);
+const DATASET_STATUSES = new Set(["complete", "partial", "not_collected"]);
 const EXPECTED_RANK_LOCALES = new Set(["fr-BE", "nl-BE", "nl-NL"]);
 const BUCKET = "bol-retailer-api-json";
 const MAX_MESSAGES_PER_INVOCATION = 2;
 const MAX_TRANSFORM_ATTEMPTS = 5;
 
 type JsonRecord = Record<string, unknown>;
-type SupabaseClient = ReturnType<typeof createClient>;
+type JsonPathSegment = string | number;
+type RawJsonNumber = { path: JsonPathSegment[]; source: string };
+const RAW_JSON_NUMBER_SOURCES = new WeakMap<object, Map<string, string>>();
+type SupabaseClient = SupabaseJsClient<any, "public", any>;
 type Claim = {
   status: string;
   messageId: number;
@@ -88,8 +94,24 @@ function record(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 }
 
+function isRecord(value: unknown): value is JsonRecord {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function rows(value: unknown): JsonRecord[] {
   return Array.isArray(value) ? value.filter(item => item && typeof item === "object" && !Array.isArray(item)) as JsonRecord[] : [];
+}
+
+function contractRows(value: unknown, code: string, label: string): JsonRecord[] {
+  assertContract(Array.isArray(value), code, `${label} must be an array.`);
+  assertContract(value.every(isRecord), code, `${label} must contain only objects.`);
+  return value as JsonRecord[];
+}
+
+function rawJsonNumberSource(container: unknown, key: string | number) {
+  return container && typeof container === "object"
+    ? RAW_JSON_NUMBER_SOURCES.get(container)?.get(String(key))
+    : undefined;
 }
 
 function text(value: unknown): string {
@@ -100,6 +122,10 @@ function nullableText(value: unknown): string | null {
   const result = text(value).trim();
   return result ? result : null;
 }
+
+// Tolerant numeric normalization is limited to nonfinancial status, storage,
+// catalog-stock, rank, and country-insight fields. Monetary and published
+// quantity contracts use strictJsonDecimal/positiveInt32 instead.
 
 function numberValue(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
@@ -112,16 +138,156 @@ function integer(value: unknown, fallback = 0): number {
   return result === null ? fallback : Math.trunc(result);
 }
 
+const POSTGRES_INT32_MAX = 2_147_483_647;
+
+function positiveInt32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= POSTGRES_INT32_MAX;
+}
+
+function nonnegativeInt32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= POSTGRES_INT32_MAX;
+}
+
 function round(value: number, decimals = 2) {
   const factor = 10 ** decimals;
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
+type DecimalFraction = { numerator: bigint; denominator: bigint; source: string };
+
+function strictJsonDecimal(
+  value: unknown,
+  code: string,
+  label: string,
+  options: { allowNegative?: boolean; maxSignificantDigits?: number; rawSource?: string } = {},
+): DecimalFraction {
+  const allowNegative = options.allowNegative ?? true;
+  const maxSignificantDigits = options.maxSignificantDigits ?? 16;
+  assertContract(typeof value === "number" && Number.isFinite(value), code, `${label} must be a finite JSON number.`);
+  assertContract(!Number.isInteger(value) || Number.isSafeInteger(value), code, `${label} exceeds safe integer precision.`);
+  const source = options.rawSource ?? String(value);
+  assertContract(!/[eE]/.test(source), code, `${label} must not use exponent notation.`);
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(source);
+  assertContract(match, code, `${label} must use canonical decimal notation.`);
+  const significantDigits = `${match[2]}${match[3] || ""}`.replace(/^0+/, "").length || 1;
+  assertContract(significantDigits <= maxSignificantDigits, code, `${label} exceeds supported decimal precision.`);
+  const sign = match[1] === "-" ? -1n : 1n;
+  assertContract(allowNegative || sign > 0n, code, `${label} cannot be negative.`);
+  const fractionDigits = match[3] || "";
+  return {
+    numerator: sign * BigInt(`${match[2]}${fractionDigits}`),
+    denominator: 10n ** BigInt(fractionDigits.length),
+    source,
+  };
+}
+
+function divideHalfUp(numerator: bigint, denominator: bigint) {
+  if (denominator <= 0n) throw new Error("A positive denominator is required.");
+  const sign = numerator < 0n ? -1n : 1n;
+  const absolute = numerator < 0n ? -numerator : numerator;
+  const quotient = absolute / denominator;
+  const remainder = absolute % denominator;
+  const rounded = remainder * 2n >= denominator ? quotient + 1n : quotient;
+  return sign * rounded;
+}
+
+function moneyToMinor(fraction: DecimalFraction) {
+  return divideHalfUp(fraction.numerator * 100n, fraction.denominator);
+}
+
+function lineGrossToMinor(unitPrice: DecimalFraction, quantity: number) {
+  return divideHalfUp(unitPrice.numerator * BigInt(quantity) * 100n, unitPrice.denominator);
+}
+
+function allocateMinor(totalMinor: bigint, quantity: number, totalQuantity: number) {
+  return divideHalfUp(totalMinor * BigInt(quantity), BigInt(totalQuantity));
+}
+
+function scaledRatioToNumber(numerator: bigint, denominator: bigint, decimals: number) {
+  const scale = 10n ** BigInt(decimals);
+  const scaled = divideHalfUp(numerator * scale, denominator);
+  const numeric = Number(scaled);
+  if (!Number.isSafeInteger(numeric)) throw new PermanentTransformError("MONEY_OUT_OF_RANGE", "Monetary value exceeds the safe publication range.");
+  return numeric / Number(scale);
+}
+
+
+type ExactDatabaseDecimal = { scaled: bigint; text: string };
+const NUMERIC_14_MAX_SCALED = 99_999_999_999_999n;
+
+function decimalTextFromScaled(value: bigint, scaleDigits = 4) {
+  const sign = value < 0n ? "-" : "";
+  const absolute = value < 0n ? -value : value;
+  const scale = 10n ** BigInt(scaleDigits);
+  const fraction = String(absolute % scale).padStart(scaleDigits, "0").replace(/0+$/, "");
+  return `${sign}${absolute / scale}${fraction ? `.${fraction}` : ""}`;
+}
+
+function amountScalar(value: unknown, rawSource?: string): { value: unknown; rawSource?: string } {
+  if (!isRecord(value)) return { value, rawSource };
+  if ("amount" in value) return { value: value.amount, rawSource: rawJsonNumberSource(value, "amount") };
+  if ("value" in value) return { value: value.value, rawSource: rawJsonNumberSource(value, "value") };
+  return { value, rawSource };
+}
+
+function databaseDecimal(
+  value: unknown,
+  code: string,
+  label: string,
+  options: { required?: boolean; allowNegative?: boolean; scaleDigits?: number; minScaled?: bigint; maxScaled?: bigint; rawSource?: string } = {},
+): ExactDatabaseDecimal | null {
+  if (value === null || value === undefined) {
+    assertContract(!options.required, code, `${label} is required.`);
+    return null;
+  }
+  const scaleDigits = options.scaleDigits ?? 4;
+  const scalar = amountScalar(value, options.rawSource);
+  const fraction = strictJsonDecimal(scalar.value, code, label, {
+    allowNegative: options.allowNegative,
+    rawSource: scalar.rawSource,
+  });
+  const scaledNumerator = fraction.numerator * (10n ** BigInt(scaleDigits));
+  assertContract(scaledNumerator % fraction.denominator === 0n, code, `${label} supports at most ${scaleDigits} decimal places.`);
+  const scaled = scaledNumerator / fraction.denominator;
+  assertContract(
+    scaled >= -NUMERIC_14_MAX_SCALED && scaled <= NUMERIC_14_MAX_SCALED,
+    code,
+    `${label} exceeds PostgreSQL numeric(14,${scaleDigits}).`,
+  );
+  if (options.minScaled !== undefined) assertContract(scaled >= options.minScaled, code, `${label} is below its allowed range.`);
+  if (options.maxScaled !== undefined) assertContract(scaled <= options.maxScaled, code, `${label} exceeds its allowed range.`);
+  return { scaled, text: decimalTextFromScaled(scaled, scaleDigits) };
+}
+
+function minorToMajor(value: bigint) {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric)) throw new PermanentTransformError("MONEY_OUT_OF_RANGE", "Monetary value exceeds the safe publication range.");
+  return numeric / 100;
+}
+
+const NUMERIC_14_2_MAX_MINOR = 99_999_999_999_999n;
+
+function assertMinorRange(value: bigint, code: string, label: string, allowNegative = false) {
+  assertContract(allowNegative || value >= 0n, code, `${label} cannot be negative.`);
+  assertContract(
+    value >= -NUMERIC_14_2_MAX_MINOR && value <= NUMERIC_14_2_MAX_MINOR,
+    code,
+    `${label} exceeds PostgreSQL numeric(14,2).`,
+  );
+}
+
 function isoDate(value: unknown): string | null {
-  if (typeof value === "number" && Number.isFinite(value)) return new Date(value).toISOString().slice(0, 10);
-  const result = text(value);
-  if (/^\d{4}-\d{2}-\d{2}/.test(result)) return result.slice(0, 10);
-  return null;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) return null;
+  return value;
+}
+
+function dateFromTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4}-\d{2}-\d{2})T/.exec(value);
+  if (!match || !isoDate(match[1]) || !isoTimestamp(value)) return null;
+  return match[1];
 }
 
 function isoTimestamp(value: unknown): string | null {
@@ -132,21 +298,33 @@ function isoTimestamp(value: unknown): string | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
-function periodDate(value: JsonRecord): string | null {
-  const direct = isoDate(value.date);
-  if (direct) return direct;
-  const period = record(value.period);
-  const year = integer(period.year);
-  const month = integer(period.month);
-  const day = integer(period.day);
-  if (!year || !month || !day) return null;
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+function isoWeekParts(start: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return null;
+  const monday = new Date(`${start}T00:00:00.000Z`);
+  if (Number.isNaN(monday.getTime()) || monday.getUTCDay() !== 1) return null;
+  const thursday = new Date(monday);
+  thursday.setUTCDate(thursday.getUTCDate() + 3);
+  const yearStart = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+  const isoWeek = Math.ceil((((thursday.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  const isoYear = thursday.getUTCFullYear();
+  return { isoYear, isoWeek, label: `${isoYear}-W${String(isoWeek).padStart(2, "0")}` };
 }
 
-function amount(value: unknown): number | null {
-  if (typeof value === "number") return numberValue(value);
-  const object = record(value);
-  return numberValue(object.amount ?? object.value);
+function addUtcDays(date: string, days: number) {
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function periodDate(value: JsonRecord): string | null {
+  if ("date" in value) return isoDate(value.date);
+  const period = record(value.period);
+  if (![period.year, period.month, period.day].every(part => typeof part === "number" && Number.isInteger(part))) return null;
+  const year = period.year as number;
+  const month = period.month as number;
+  const day = period.day as number;
+  return isoDate(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
 }
 
 function currency(value: unknown): string | null {
@@ -166,7 +344,7 @@ function stableStringify(value: unknown) {
 
 async function sha256Hex(value: string | Uint8Array) {
   const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -231,12 +409,137 @@ async function downloadObject(supabase: SupabaseClient, bucket: string, path: st
   return { bytes, text: new TextDecoder().decode(bytes), sha256: await sha256Hex(bytes) };
 }
 
+function financialNumberScale(label: string, path: JsonPathSegment[]): number | null | undefined {
+  const names = path.filter((part): part is string => typeof part === "string").map(part => part.toLowerCase());
+  const leaf = names.at(-1) || "";
+  const parent = names.at(-2) || "";
+  const semantic = leaf === "amount" || leaf === "value" ? parent : leaf;
+  if (label === "commercial.json" && ["unitprice", "totalprice", "commission"].includes(semantic)) return null;
+  if (label === "catalog.json" && ["unitprice", "fixedamount", "percentage", "totalcost", "totalcostwithoutreduction"].includes(semantic)) return null;
+  if (label !== "financial.json" || !names.includes("settlement")) return undefined;
+  if (["payableamount", "taxexclusiveamount", "taxinclusiveamount"].includes(semantic)) return 2;
+  if (["quantity", "invoicedquantity", "lineextensionamount", "priceamount", "taxamount", "taxpercentage", "percent"].includes(semantic)) return 4;
+  return undefined;
+}
+
+function validateRawFinancialNumber(label: string, token: RawJsonNumber) {
+  const scale = financialNumberScale(label, token.path);
+  if (scale === undefined) return;
+  const pointer = `/${token.path.join("/")}`;
+  assertContract(!/[eE]/.test(token.source), "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} must not use exponent notation.`);
+  const match = /^-?(\d+)(?:\.(\d+))?$/.exec(token.source);
+  assertContract(match, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} must use canonical decimal notation.`);
+  const significantDigits = `${match[1]}${match[2] || ""}`.replace(/^0+/, "").length || 1;
+  assertContract(significantDigits <= 16, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} exceeds supported decimal precision.`);
+  if (scale !== null) {
+    assertContract((match[2]?.length || 0) <= scale, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} supports at most ${scale} decimal places.`);
+  }
+}
+
+function collectRawJsonNumbers(textValue: string, label: string): RawJsonNumber[] {
+  let index = 0;
+  const tokens: RawJsonNumber[] = [];
+  const whitespace = () => {
+    while (/\s/.test(textValue[index] || "")) index += 1;
+  };
+  const fail = (message: string): never => { throw new SyntaxError(`${message} at character ${index}`); };
+  const parseString = () => {
+    const start = index;
+    if (textValue[index] !== '"') fail("Expected string");
+    index += 1;
+    while (index < textValue.length) {
+      if (textValue[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (textValue[index] === '"') {
+        index += 1;
+        return JSON.parse(textValue.slice(start, index)) as string;
+      }
+      index += 1;
+    }
+    return fail("Unterminated string");
+  };
+  const parseValue = (path: JsonPathSegment[]): void => {
+    whitespace();
+    const character = textValue[index];
+    if (character === "{") {
+      index += 1;
+      whitespace();
+      if (textValue[index] === "}") { index += 1; return; }
+      while (index < textValue.length) {
+        const key = parseString();
+        whitespace();
+        if (textValue[index] !== ":") fail("Expected colon");
+        index += 1;
+        parseValue([...path, key]);
+        whitespace();
+        if (textValue[index] === "}") { index += 1; return; }
+        if (textValue[index] !== ",") fail("Expected comma");
+        index += 1;
+        whitespace();
+      }
+      fail("Unterminated object");
+    }
+    if (character === "[") {
+      index += 1;
+      whitespace();
+      if (textValue[index] === "]") { index += 1; return; }
+      let itemIndex = 0;
+      while (index < textValue.length) {
+        parseValue([...path, itemIndex]);
+        itemIndex += 1;
+        whitespace();
+        if (textValue[index] === "]") { index += 1; return; }
+        if (textValue[index] !== ",") fail("Expected comma");
+        index += 1;
+      }
+      fail("Unterminated array");
+    }
+    if (character === '"') { parseString(); return; }
+    for (const literal of ["true", "false", "null"]) {
+      if (textValue.startsWith(literal, index)) { index += literal.length; return; }
+    }
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(textValue.slice(index));
+    if (match === null) throw new SyntaxError(`Expected JSON value at character ${index}`);
+    const token = { path, source: match[0] };
+    validateRawFinancialNumber(label, token);
+    tokens.push(token);
+    index += match[0].length;
+  };
+
+  parseValue([]);
+  whitespace();
+  if (index !== textValue.length) fail("Unexpected trailing content");
+  return tokens;
+}
+
+function attachRawJsonNumbers(root: JsonRecord, tokens: RawJsonNumber[]) {
+  for (const token of tokens) {
+    let parent: unknown = root;
+    for (const segment of token.path.slice(0, -1)) {
+      if (!parent || typeof parent !== "object") break;
+      parent = (parent as Record<string | number, unknown>)[segment];
+    }
+    const key = token.path.at(-1);
+    if (!parent || typeof parent !== "object" || key === undefined) continue;
+    const sources = RAW_JSON_NUMBER_SOURCES.get(parent) || new Map<string, string>();
+    sources.set(String(key), token.source);
+    RAW_JSON_NUMBER_SOURCES.set(parent, sources);
+  }
+}
+
 function parseJson(textValue: string, label: string): JsonRecord {
   try {
+    const rawNumbers = ["commercial.json", "catalog.json", "financial.json"].includes(label)
+      ? collectRawJsonNumbers(textValue, label)
+      : [];
     const parsed = JSON.parse(textValue);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("root is not an object");
+    attachRawJsonNumbers(parsed as JsonRecord, rawNumbers);
     return parsed as JsonRecord;
   } catch (error) {
+    if (error instanceof PermanentTransformError) throw error;
     throw new PermanentTransformError("INVALID_JSON", `${label} is not valid JSON: ${error instanceof Error ? error.message : "parse failure"}`);
   }
 }
@@ -245,20 +548,92 @@ function assertContract(condition: unknown, code: string, message: string): asse
   if (!condition) throw new PermanentTransformError(code, message);
 }
 
+function validateDatasetStatusContract(value: unknown) {
+  assertContract(isRecord(value), "INVALID_DATASET_STATUSES", "Manifest datasetStatuses must be an object.");
+  const statuses = value as JsonRecord;
+  const names = Object.keys(statuses).sort();
+  assertContract(
+    stableStringify(names) === stableStringify([...EXPECTED_DATASETS].sort()),
+    "DATASET_STATUS_SET_MISMATCH",
+    `Manifest must describe exactly ${EXPECTED_DATASETS.length} source datasets.`,
+  );
+
+  for (const dataset of EXPECTED_DATASETS) {
+    const detailValue = statuses[dataset];
+    assertContract(isRecord(detailValue), "INVALID_DATASET_STATUS", `Dataset ${dataset} has no status detail.`);
+    const detail = detailValue as JsonRecord;
+    const status = text(detail.status);
+    assertContract(DATASET_STATUSES.has(status), "INVALID_DATASET_STATUS", `Dataset ${dataset} has unsupported status ${status || "empty"}.`);
+    const counts = ["calls", "errors", "unavailable", "rows"].map(field => detail[field]);
+    assertContract(
+      counts.every(count => typeof count === "number" && Number.isInteger(count) && count >= 0),
+      "INVALID_DATASET_STATUS",
+      `Dataset ${dataset} must contain nonnegative integer calls, errors, unavailable, and rows.`,
+    );
+    const calls = detail.calls as number;
+    const errors = detail.errors as number;
+    const unavailable = detail.unavailable as number;
+    const rowCount = detail.rows as number;
+    assertContract(errors + unavailable <= calls, "INVALID_DATASET_STATUS", `Dataset ${dataset} reports more outcomes than calls.`);
+    assertContract(status !== "complete" || errors === 0, "INVALID_DATASET_STATUS", `Complete dataset ${dataset} cannot contain errors.`);
+    assertContract(status === "not_collected" ? calls === 0 && errors === 0 && unavailable === 0 && rowCount === 0 : calls > 0, "INVALID_DATASET_STATUS", `Dataset ${dataset} counts do not agree with status ${status}.`);
+  }
+  return statuses;
+}
+
+function validateManifestContract(manifest: JsonRecord, claim: Claim) {
+  const week = record(manifest.week);
+  const manifestStatus = text(manifest.status);
+  const generatedAt = text(manifest.generatedAt);
+  const expectedWeek = isoWeekParts(claim.periodStart);
+  const expectedManifestPath = `retailer-api/year=${claim.isoYear}/week=${String(claim.isoWeek).padStart(2, "0")}/run=${claim.sourceRunId}/manifest.json`;
+
+  assertContract(claim.sourceContractVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Claimed source contract ${claim.sourceContractVersion} is not supported.`);
+  assertContract(manifest.schemaVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Source contract ${text(manifest.schemaVersion)} is not supported.`);
+  assertContract(manifest.runId === claim.sourceRunId, "MANIFEST_RUN_MISMATCH", "Manifest run ID does not match the claimed source run.");
+  assertContract(claim.manifestPath === expectedManifestPath, "MANIFEST_PATH_MISMATCH", "Manifest path does not match the claimed year, week, and source run.");
+  assertContract(TERMINAL_SOURCE_STATUSES.has(manifestStatus), "SOURCE_NOT_TERMINAL", "Manifest does not contain a terminal source status.");
+  assertContract(manifestStatus === claim.sourceStatus, "SOURCE_STATUS_MISMATCH", "Manifest status does not match the authoritative source run status.");
+  assertContract(expectedWeek && expectedWeek.isoYear === claim.isoYear && expectedWeek.isoWeek === claim.isoWeek, "CLAIM_WEEK_MISMATCH", "Claimed ISO year and week do not match the claimed Monday.");
+  assertContract(week.label === expectedWeek?.label && week.start === claim.periodStart && week.end === claim.periodEnd && addUtcDays(claim.periodStart, 6) === claim.periodEnd, "MANIFEST_WEEK_MISMATCH", "Manifest week does not match the claimed complete ISO week.");
+  assertContract(/^\d{4}-\d{2}-\d{2}T/.test(generatedAt) && isoTimestamp(generatedAt), "INVALID_MANIFEST_GENERATED_AT", "Manifest generatedAt must be a valid timestamp.");
+  assertContract(isRecord(manifest.summary), "INVALID_MANIFEST_SUMMARY", "Manifest summary must be an object.");
+  assertContract(isRecord(manifest.completeness), "INVALID_MANIFEST_COMPLETENESS", "Manifest completeness must be an object.");
+  assertContract(Array.isArray(manifest.warnings) && manifest.warnings.every(value => typeof value === "string"), "INVALID_MANIFEST_WARNINGS", "Manifest warnings must be an array of strings.");
+  validateDatasetStatusContract(manifest.datasetStatuses);
+
+  const manifestArtifacts = rows(manifest.artifacts);
+  const names = manifestArtifacts.map(item => text(item.name)).sort();
+  assertContract(stableStringify(names) === stableStringify([...EXPECTED_ARTIFACTS].sort()), "ARTIFACT_SET_MISMATCH", `Expected ${EXPECTED_ARTIFACTS.length} named artifacts.`);
+  const basePath = expectedManifestPath.slice(0, expectedManifestPath.lastIndexOf("/"));
+  for (const descriptor of manifestArtifacts) {
+    const name = text(descriptor.name);
+    assertContract(text(descriptor.path) === `${basePath}/${name}.json`, "ARTIFACT_PATH_MISMATCH", `${name}.json does not use the exact claimed run path.`);
+    assertContract(/^[0-9a-f]{64}$/.test(text(descriptor.sha256)), "INVALID_ARTIFACT_HASH", `${name}.json has an invalid manifest hash.`);
+    assertContract(typeof descriptor.bytes === "number" && Number.isInteger(descriptor.bytes) && descriptor.bytes > 0, "INVALID_ARTIFACT_SIZE", `${name}.json must be a nonempty stored artifact.`);
+  }
+  return manifestArtifacts;
+}
+
+function validateArtifactEnvelope(name: string, artifact: JsonRecord, manifest: JsonRecord) {
+  assertContract(stableStringify(record(artifact.week)) === stableStringify(record(manifest.week)), "ARTIFACT_WEEK_MISMATCH", `${name}.json week does not match the manifest.`);
+  assertContract(artifact.generatedAt === manifest.generatedAt, "ARTIFACT_GENERATED_AT_MISMATCH", `${name}.json generatedAt does not match the manifest.`);
+  if (name === "commercial") assertContract(isRecord(artifact.operational), "INVALID_COMMERCIAL_ARTIFACT", "commercial.json has no operational object.");
+  if (name === "catalog") assertContract(isRecord(artifact.currentState), "INVALID_CATALOG_ARTIFACT", "catalog.json has no currentState object.");
+  if (name === "insights") assertContract(isRecord(artifact.weekMetrics) && Array.isArray(artifact.ranks), "INVALID_INSIGHTS_ARTIFACT", "insights.json has no weekMetrics object or ranks array.");
+  if (name === "financial") assertContract(isRecord(artifact.settlement), "INVALID_FINANCIAL_ARTIFACT", "financial.json has no settlement object.");
+  if (name === "provenance") {
+    assertContract(isRecord(artifact.summary) && isRecord(artifact.completeness) && Array.isArray(artifact.calls), "INVALID_PROVENANCE_ARTIFACT", "provenance.json is missing its summary, completeness, or calls.");
+    assertContract(stableStringify(artifact.datasetStatuses) === stableStringify(manifest.datasetStatuses), "PROVENANCE_STATUS_MISMATCH", "provenance.json dataset statuses do not match the manifest.");
+  }
+}
+
 async function loadVerifiedPackage(supabase: SupabaseClient, claim: Claim) {
   assertContract(claim.storageBucket === BUCKET, "UNEXPECTED_BUCKET", `Expected ${BUCKET}, received ${claim.storageBucket}.`);
   const manifestObject = await downloadObject(supabase, claim.storageBucket, claim.manifestPath);
   assertContract(manifestObject.sha256 === claim.manifestSha256, "MANIFEST_HASH_MISMATCH", "Manifest hash does not match the source run log.");
   const manifest = parseJson(manifestObject.text, "manifest.json");
-  const week = record(manifest.week);
-  assertContract(manifest.schemaVersion === SOURCE_CONTRACT_VERSION, "UNSUPPORTED_SOURCE_CONTRACT", `Source contract ${text(manifest.schemaVersion)} is not supported.`);
-  assertContract(manifest.runId === claim.sourceRunId, "MANIFEST_RUN_MISMATCH", "Manifest run ID does not match the claimed source run.");
-  assertContract(week.start === claim.periodStart && week.end === claim.periodEnd, "MANIFEST_WEEK_MISMATCH", "Manifest period does not match the claimed ISO week.");
-  assertContract(["complete", "partial"].includes(text(manifest.status)), "SOURCE_NOT_TERMINAL", "Manifest does not contain a terminal source status.");
-
-  const manifestArtifacts = rows(manifest.artifacts);
-  const names = manifestArtifacts.map(item => text(item.name)).sort();
-  assertContract(JSON.stringify(names) === JSON.stringify([...EXPECTED_ARTIFACTS].sort()), "ARTIFACT_SET_MISMATCH", `Expected ${EXPECTED_ARTIFACTS.length} named artifacts.`);
+  const manifestArtifacts = validateManifestContract(manifest, claim);
   assertContract(claim.sourceArtifactCount === EXPECTED_ARTIFACTS.length + 1, "ARTIFACT_COUNT_MISMATCH", "Source run log does not report exactly seven artifacts.");
 
   const basePath = claim.manifestPath.slice(0, claim.manifestPath.lastIndexOf("/"));
@@ -282,13 +657,17 @@ async function loadVerifiedPackage(supabase: SupabaseClient, claim: Claim) {
     const path = text(descriptor.path);
     const expectedHash = text(descriptor.sha256);
     const expectedBytes = integer(descriptor.bytes, -1);
-    assertContract(path.startsWith(`${basePath}/`) && path.endsWith(`/${name}.json`), "ARTIFACT_PATH_MISMATCH", `${name}.json is outside the claimed run folder.`);
+    assertContract(path === `${basePath}/${name}.json`, "ARTIFACT_PATH_MISMATCH", `${name}.json does not use the exact claimed run path.`);
     assertContract(/^[0-9a-f]{64}$/.test(expectedHash), "INVALID_ARTIFACT_HASH", `${name}.json has an invalid manifest hash.`);
-    assertContract(expectedBytes >= 0, "INVALID_ARTIFACT_SIZE", `${name}.json has an invalid manifest size.`);
+    assertContract(expectedBytes > 0, "INVALID_ARTIFACT_SIZE", `${name}.json must be a nonempty stored artifact.`);
     const object = await downloadObject(supabase, claim.storageBucket, path);
     assertContract(object.bytes.byteLength === expectedBytes, "ARTIFACT_SIZE_MISMATCH", `${name}.json byte count does not match the manifest.`);
     assertContract(object.sha256 === expectedHash, "ARTIFACT_HASH_MISMATCH", `${name}.json hash does not match the manifest.`);
-    if (name !== "operations") artifacts[name] = parseJson(object.text, `${name}.json`);
+    if (name !== "operations") {
+      const artifact = parseJson(object.text, `${name}.json`);
+      validateArtifactEnvelope(name, artifact, manifest);
+      artifacts[name] = artifact;
+    }
     evidence.push({
       artifact_name: name,
       storage_bucket: claim.storageBucket,
@@ -320,14 +699,37 @@ function additionalProperties(line: JsonRecord) {
 function invoiceLineFields(line: JsonRecord, invoiceId: string, index: number) {
   const item = record(line.Item ?? line.item);
   const descriptions = rows(item.Description ?? item.description);
-  const taxTotal = rows(line.TaxTotal ?? line.taxTotal)[0] || record(line.taxAmount);
-  const taxAmount = record(taxTotal.TaxAmount ?? line.taxAmount);
+  const taxTotal = rows(line.TaxTotal ?? line.taxTotal)[0];
+  const taxTotalRecord = record(taxTotal);
   const taxCategories = rows(item.ClassifiedTaxCategory ?? item.classifiedTaxCategory);
   const properties = additionalProperties(line);
   const transactionType = text(line.type ?? record(item.Name ?? item.name).value ?? item.Name ?? item.name);
   const lineRef = text(line.invoiceLineRef ?? line.InvoiceLineRef ?? `${invoiceId}#${transactionType || "LINE"}`);
-  const lineAmountObject = line.lineExtensionAmount ?? line.LineExtensionAmount;
-  const lineAmount = amount(lineAmountObject);
+  const lineAmountKey = "lineExtensionAmount" in line ? "lineExtensionAmount" : "LineExtensionAmount";
+  const lineAmountObject = line[lineAmountKey];
+  const quantityKey = "quantity" in line ? "quantity" : "InvoicedQuantity";
+  const quantitySource = line[quantityKey];
+  const priceContainer = "priceAmount" in line ? line : record(line.Price);
+  const priceKey = "priceAmount" in line ? "priceAmount" : "PriceAmount";
+  const priceSource = priceContainer[priceKey];
+  const taxAmountKey = "taxAmount" in line ? "taxAmount" : "TaxAmount" in taxTotalRecord ? "TaxAmount" : "taxAmount";
+  const taxAmountContainer = "taxAmount" in line ? line : taxTotalRecord;
+  const taxAmountSource = taxAmountContainer[taxAmountKey];
+  const firstTaxCategory = taxCategories[0];
+  const taxPercentageContainer = "taxPercentage" in line ? line : isRecord(firstTaxCategory?.Percent) ? firstTaxCategory.Percent : firstTaxCategory;
+  const taxPercentageKey = "taxPercentage" in line ? "taxPercentage" : isRecord(firstTaxCategory?.Percent) ? "value" : "Percent";
+  const taxPercentageSource = taxPercentageContainer?.[taxPercentageKey];
+  const lineAmount = databaseDecimal(lineAmountObject, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount`, { required: true, rawSource: rawJsonNumberSource(line, lineAmountKey) });
+  assertContract(lineAmount, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount is required.`);
+  const quantity = databaseDecimal(quantitySource, "INVALID_INVOICE_QUANTITY", `Invoice ${invoiceId} line ${index} quantity`, { rawSource: rawJsonNumberSource(line, quantityKey) });
+  const priceAmount = databaseDecimal(priceSource, "INVALID_INVOICE_PRICE_AMOUNT", `Invoice ${invoiceId} line ${index} priceAmount`, { rawSource: rawJsonNumberSource(priceContainer, priceKey) });
+  const parsedTaxAmount = databaseDecimal(taxAmountSource, "INVALID_INVOICE_TAX_AMOUNT", `Invoice ${invoiceId} line ${index} taxAmount`, { rawSource: rawJsonNumberSource(taxAmountContainer, taxAmountKey) });
+  const taxPercentage = databaseDecimal(
+    taxPercentageSource,
+    "INVALID_INVOICE_TAX_PERCENTAGE",
+    `Invoice ${invoiceId} line ${index} taxPercentage`,
+    { allowNegative: false, minScaled: 0n, maxScaled: 1_000_000n, rawSource: rawJsonNumberSource(taxPercentageContainer, taxPercentageKey) },
+  );
   return {
     invoice_id: invoiceId,
     invoice_line_ref: lineRef,
@@ -337,14 +739,14 @@ function invoiceLineFields(line: JsonRecord, invoiceId: string, index: number) {
     track_and_trace: nullableText(properties.trackandtrace ?? properties["track-and-trace"]),
     item_name: transactionType || null,
     item_description: nullableText(line.description ?? descriptions[0]?.value ?? item.Description),
-    quantity: numberValue(line.quantity ?? record(line.InvoicedQuantity).value),
-    line_extension_amount: lineAmount,
-    price_amount: amount(line.priceAmount ?? record(line.Price).PriceAmount),
-    tax_amount: amount(line.taxAmount ?? taxAmount),
-    tax_percentage: numberValue(line.taxPercentage ?? record(taxCategories[0]?.Percent).value),
-    currency: currency(lineAmountObject) || currency(line.priceAmount ?? record(line.Price).PriceAmount),
-    source_sign: lineAmount,
-    settlement_effect: lineAmount === null ? null : -lineAmount,
+    quantity: quantity?.text ?? null,
+    line_extension_amount: lineAmount.text,
+    price_amount: priceAmount?.text ?? null,
+    tax_amount: parsedTaxAmount?.text ?? null,
+    tax_percentage: taxPercentage?.text ?? null,
+    currency: currency(lineAmountObject) || currency(priceSource),
+    source_sign: lineAmount.text,
+    settlement_effect: decimalTextFromScaled(-lineAmount.scaled),
     raw_line: line,
     _line_index: index,
   };
@@ -377,22 +779,29 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const exceptions: JsonRecord[] = [];
 
   const shipmentCandidates = new Map<string, JsonRecord[]>();
+  const commercialEans = new Set<string>();
+  const commercialEanByOfferId = new Map<string, string>();
+  const commercialOfferIdsByEan = new Map<string, Set<string>>();
+  const matchedReturnGroups = new Map<string, {
+    candidate: JsonRecord;
+    returns: Array<{ rmaId: string; expectedQuantity: number }>;
+  }>();
   const productMetrics = new Map<string, {
     grossUnits: number;
-    grossGms: number;
-    grossCommission: number;
+    grossGmsMinor: bigint;
+    grossCommissionMinor: bigint;
     registeredReturns: number;
     linkedReturns: number;
     unlinkedReturns: number;
-    linkedReturnGms: number;
-    linkedReturnCommission: number;
+    linkedReturnGmsMinor: bigint;
+    linkedReturnCommissionMinor: bigint;
     visits: number | null;
     limitations: string[];
   }>();
   const metricFor = (ean: string) => {
     const existing = productMetrics.get(ean);
     if (existing) return existing;
-    const created = { grossUnits: 0, grossGms: 0, grossCommission: 0, registeredReturns: 0, linkedReturns: 0, unlinkedReturns: 0, linkedReturnGms: 0, linkedReturnCommission: 0, visits: null, limitations: [] as string[] };
+    const created = { grossUnits: 0, grossGmsMinor: 0n, grossCommissionMinor: 0n, registeredReturns: 0, linkedReturns: 0, unlinkedReturns: 0, linkedReturnGmsMinor: 0n, linkedReturnCommissionMinor: 0n, visits: null, limitations: [] as string[] };
     productMetrics.set(ean, created);
     return created;
   };
@@ -414,7 +823,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const order = record(detail.order);
     const orderId = nullableText(order.orderId);
     const shipmentAt = isoTimestamp(detail.shipmentDateTime);
-    const shipmentDate = isoDate(detail.shipmentDateTime);
+    const shipmentDate = dateFromTimestamp(detail.shipmentDateTime);
     assertContract(shipmentAt, "INVALID_SHIPMENT_DATE", `Shipment ${shipmentId} has no valid shipment timestamp.`);
     assertContract(
       shipmentDate && shipmentDate >= claim.periodStart && shipmentDate <= claim.periodEnd,
@@ -445,10 +854,50 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const fulfilment = record(item.fulfilment);
       const orderItemId = text(item.orderItemId);
       const ean = text(product.ean ?? item.ean);
-      const quantityShipped = integer(item.quantityShipped ?? item.quantity);
-      const unitPrice = numberValue(item.unitPrice);
-      const commission = numberValue(item.commission);
-      assertContract(orderItemId && /^\d{13}$/.test(ean) && quantityShipped > 0 && unitPrice !== null && commission !== null, "INVALID_SHIPMENT_ITEM", `Shipment ${shipmentId} contains an invalid business line.`);
+      const rawQuantityShipped = item.quantityShipped;
+      assertContract(
+        positiveInt32(rawQuantityShipped),
+        "INVALID_SHIPMENT_QUANTITY",
+        `Shipment ${shipmentId} item ${itemIndex} quantity must be a positive PostgreSQL int32 JSON number.`,
+      );
+      const quantityShipped = rawQuantityShipped;
+      const unitPrice = strictJsonDecimal(
+        item.unitPrice,
+        "INVALID_SHIPMENT_UNIT_PRICE",
+        `Shipment ${shipmentId} item ${itemIndex} unitPrice`,
+        { allowNegative: false, rawSource: rawJsonNumberSource(item, "unitPrice") },
+      );
+      const commission = strictJsonDecimal(
+        item.commission,
+        "INVALID_SHIPMENT_COMMISSION",
+        `Shipment ${shipmentId} item ${itemIndex} commission`,
+        { allowNegative: false, rawSource: rawJsonNumberSource(item, "commission") },
+      );
+      const lineGrossMinor = lineGrossToMinor(unitPrice, quantityShipped);
+      const unitPriceMinor = moneyToMinor(unitPrice);
+      const commissionMinor = moneyToMinor(commission);
+      assertMinorRange(lineGrossMinor, "INVALID_SHIPMENT_UNIT_PRICE", `Shipment ${shipmentId} item ${itemIndex} line gross`);
+      assertMinorRange(unitPriceMinor, "INVALID_SHIPMENT_UNIT_PRICE", `Shipment ${shipmentId} item ${itemIndex} unitPrice`);
+      assertMinorRange(commissionMinor, "INVALID_SHIPMENT_COMMISSION", `Shipment ${shipmentId} item ${itemIndex} commission`);
+      assertContract(
+        orderItemId && /^\d{13}$/.test(ean),
+        "INVALID_SHIPMENT_ITEM",
+        `Shipment ${shipmentId} contains an invalid business line.`,
+      );
+      commercialEans.add(ean);
+      const shipmentOfferId = nullableText(offer.offerId);
+      const existingCommercialOfferEan = shipmentOfferId ? commercialEanByOfferId.get(shipmentOfferId) : null;
+      assertContract(
+        !existingCommercialOfferEan || existingCommercialOfferEan === ean,
+        "COMMERCIAL_OFFER_ID_EAN_CONFLICT",
+        `Shipment offer ${shipmentOfferId} is associated with multiple EANs.`,
+      );
+      if (shipmentOfferId) {
+        commercialEanByOfferId.set(shipmentOfferId, ean);
+        const eanOfferIds = commercialOfferIdsByEan.get(ean) || new Set<string>();
+        eanOfferIds.add(shipmentOfferId);
+        commercialOfferIdsByEan.set(ean, eanOfferIds);
+      }
       const shipmentItemKey = `${shipmentId}|${orderItemId}`;
       assertContract(!seenShipmentItemKeys.has(shipmentItemKey), "DUPLICATE_SHIPMENT_ITEM", `Shipment item ${shipmentItemKey} occurs more than once in the source.`);
       seenShipmentItemKeys.add(shipmentItemKey);
@@ -457,24 +906,29 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         order_id: orderId,
         order_item_id: orderItemId,
         ean,
-        offer_id: nullableText(offer.offerId),
+        offer_id: shipmentOfferId,
         product_title: nullableText(product.title),
         quantity_shipped: quantityShipped,
-        unit_price: round(unitPrice, 2),
-        commission: round(commission, 2),
+        unit_price: minorToMajor(unitPriceMinor),
+        commission: minorToMajor(commissionMinor),
         fulfilment_method: nullableText(fulfilment.method),
         distribution_party: nullableText(fulfilment.distributionParty),
         latest_delivery_date: isoDate(fulfilment.latestDeliveryDate),
       };
       const sourcePointer = `/operational/shipmentDetails/${shipmentIndex}/detail/shipmentItems/${itemIndex}`;
       facts.outbound_shipment_items.push(await fact(itemFields, `${shipmentId}|${orderItemId}`, "commercial", sourcePointer, shipmentAt, now));
-      const candidate = { ...itemFields, sourcePointer };
+      const candidate = {
+        ...itemFields,
+        sourcePointer,
+        _line_gross_minor: lineGrossMinor,
+        _commission_minor: commissionMinor,
+      };
       const matchKey = `${orderId || ""}|${ean}`;
       shipmentCandidates.set(matchKey, [...(shipmentCandidates.get(matchKey) || []), candidate]);
       const metric = metricFor(ean);
       metric.grossUnits += quantityShipped;
-      metric.grossGms += quantityShipped * unitPrice;
-      metric.grossCommission += commission;
+      metric.grossGmsMinor += lineGrossMinor;
+      metric.grossCommissionMinor += commissionMinor;
     }
   }
 
@@ -502,18 +956,37 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const orderItemId = text(item.orderItemId);
       const ean = text(product.ean ?? item.ean);
       if (!orderItemId || !/^\d{13}$/.test(ean)) continue;
+      const quantity = item.quantity;
+      const quantityShipped = item.quantityShipped;
+      const quantityCancelled = item.quantityCancelled;
+      assertContract(
+        nonnegativeInt32(quantity) && nonnegativeInt32(quantityShipped) && nonnegativeInt32(quantityCancelled),
+        "INVALID_ORDER_ITEM_QUANTITY",
+        `Order item ${orderItemId} quantities must be nonnegative int32 JSON numbers.`,
+      );
+      const unitPrice = strictJsonDecimal(item.unitPrice, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "unitPrice") });
+      const unitPriceMinor = moneyToMinor(unitPrice);
+      const totalPriceMinor = item.totalPrice === null || item.totalPrice === undefined
+        ? lineGrossToMinor(unitPrice, quantity)
+        : moneyToMinor(strictJsonDecimal(item.totalPrice, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "totalPrice") }));
+      const commissionMinor = item.commission === null || item.commission === undefined
+        ? null
+        : moneyToMinor(strictJsonDecimal(item.commission, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "commission") }));
+      assertMinorRange(unitPriceMinor, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`);
+      assertMinorRange(totalPriceMinor, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`);
+      if (commissionMinor !== null) assertMinorRange(commissionMinor, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`);
       const orderItemFields = {
         order_item_id: orderItemId,
         order_id: orderId,
         ean,
         offer_id: nullableText(offer.offerId),
         product_title: nullableText(product.title),
-        quantity: integer(item.quantity),
-        quantity_shipped: integer(item.quantityShipped),
-        quantity_cancelled: integer(item.quantityCancelled),
-        unit_price: round(numberValue(item.unitPrice) || 0, 2),
-        total_price: round(numberValue(item.totalPrice) ?? ((numberValue(item.unitPrice) || 0) * integer(item.quantity)), 2),
-        commission: numberValue(item.commission) === null ? null : round(numberValue(item.commission)!, 2),
+        quantity,
+        quantity_shipped: quantityShipped,
+        quantity_cancelled: quantityCancelled,
+        unit_price: minorToMajor(unitPriceMinor),
+        total_price: minorToMajor(totalPriceMinor),
+        commission: commissionMinor === null ? null : minorToMajor(commissionMinor),
         fulfilment_method: nullableText(fulfilment.method),
         distribution_party: nullableText(fulfilment.distributionParty),
         latest_delivery_date: isoDate(fulfilment.latestDeliveryDate),
@@ -532,7 +1005,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const returnRow = returnRows[returnIndex];
     const returnId = text(returnRow.returnId);
     const registeredAt = isoTimestamp(returnRow.registrationDateTime);
-    const registeredDate = isoDate(returnRow.registrationDateTime);
+    const registeredDate = dateFromTimestamp(returnRow.registrationDateTime);
     assertContract(returnId && registeredAt, "INVALID_RETURN_CASE", `Return row ${returnIndex} is missing its ID or registration timestamp.`);
     assertContract(
       registeredDate && registeredDate >= claim.periodStart && registeredDate <= claim.periodEnd,
@@ -548,8 +1021,15 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const rmaId = text(item.rmaId);
       const ean = text(item.ean);
       const orderId = nullableText(item.orderId);
-      const expectedQuantity = integer(item.expectedQuantity);
-      assertContract(rmaId && /^\d{13}$/.test(ean) && expectedQuantity > 0, "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
+      const rawExpectedQuantity = item.expectedQuantity;
+      assertContract(
+        positiveInt32(rawExpectedQuantity),
+        "INVALID_RETURN_QUANTITY",
+        `Return ${returnId} item ${itemIndex} expectedQuantity must be a positive PostgreSQL int32 JSON number.`,
+      );
+      const expectedQuantity = rawExpectedQuantity;
+      assertContract(rmaId && /^\d{13}$/.test(ean), "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
+      commercialEans.add(ean);
       assertContract(!seenRmas.has(rmaId), "DUPLICATE_RETURN_ITEM", `Return RMA ${rmaId} occurs more than once in the source.`);
       seenRmas.add(rmaId);
       const returnItemFields = {
@@ -569,35 +1049,28 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const metric = metricFor(ean);
       metric.registeredReturns += expectedQuantity;
       const candidates = orderId ? shipmentCandidates.get(`${orderId}|${ean}`) || [] : [];
-      if (orderId && candidates.length === 1 && expectedQuantity <= integer(candidates[0].quantity_shipped)) {
-        const candidate = candidates[0];
-        const perUnitCommission = (numberValue(candidate.commission) || 0) / integer(candidate.quantity_shipped, 1);
-        metric.linkedReturns += expectedQuantity;
-        metric.linkedReturnGms += expectedQuantity * (numberValue(candidate.unit_price) || 0);
-        metric.linkedReturnCommission += expectedQuantity * perUnitCommission;
+      const candidate = candidates.length === 1 ? candidates[0] : null;
+      const allocationKey = candidate ? `${text(candidate.shipment_id)}|${text(candidate.order_item_id)}` : null;
+      if (orderId && candidate && allocationKey) {
+        const group = matchedReturnGroups.get(allocationKey) || { candidate, returns: [] };
+        group.returns.push({ rmaId, expectedQuantity });
+        matchedReturnGroups.set(allocationKey, group);
       } else {
         metric.unlinkedReturns += expectedQuantity;
         const missingOrderId = !orderId;
-        const quantityExceedsShipment = candidates.length === 1 && expectedQuantity > integer(candidates[0].quantity_shipped);
         const ambiguous = candidates.length > 1;
         const exceptionCode = missingOrderId
           ? "RETURN_MISSING_ORDER_ID"
-          : quantityExceedsShipment
-          ? "RETURN_QUANTITY_EXCEEDS_SHIPMENT"
           : ambiguous
           ? "AMBIGUOUS_RETURN_MATCH"
           : "UNMATCHED_RETURN";
         const exceptionTitle = missingOrderId
           ? "Return has no order ID"
-          : quantityExceedsShipment
-          ? "Return quantity exceeds the matched weekly shipment"
           : ambiguous
           ? "Return has several possible shipment matches"
           : "Return has no shipment match in this week";
         const limitation = missingOrderId
           ? "Return could not be linked because its order ID is missing."
-          : quantityExceedsShipment
-          ? "Return could not be linked because its quantity exceeds the matched weekly shipment."
           : ambiguous
           ? "Return could not be linked because several shipment lines matched."
           : "Return could not be linked to a shipment in this reporting week.";
@@ -613,16 +1086,58 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
           {
             businessKey: rmaId,
             ean,
-            evidence: {
-              orderId,
-              expectedQuantity,
-              candidateCount: candidates.length,
-              matchedShipmentQuantity: candidates.length === 1 ? integer(candidates[0].quantity_shipped) : null,
-            },
+            evidence: { orderId, expectedQuantity, candidateCount: candidates.length },
           },
         ));
       }
     }
+  }
+
+  for (const [allocationKey, group] of [...matchedReturnGroups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const candidate = group.candidate;
+    const ean = text(candidate.ean);
+    const metric = metricFor(ean);
+    const shipmentQuantity = candidate.quantity_shipped as number;
+    const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
+    const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
+    assertContract(
+      positiveInt32(aggregateReturnQuantity),
+      "RETURN_QUANTITY_AGGREGATE_OUT_OF_RANGE",
+      `Shipment item ${allocationKey} aggregate return quantity exceeds PostgreSQL int32.`,
+    );
+    const lineGrossMinor = candidate._line_gross_minor as bigint;
+    const commissionMinor = candidate._commission_minor as bigint;
+
+    if (aggregateReturnQuantity <= shipmentQuantity) {
+      metric.linkedReturns += aggregateReturnQuantity;
+      metric.linkedReturnGmsMinor += allocateMinor(lineGrossMinor, aggregateReturnQuantity, shipmentQuantity);
+      metric.linkedReturnCommissionMinor += allocateMinor(commissionMinor, aggregateReturnQuantity, shipmentQuantity);
+      continue;
+    }
+
+    metric.unlinkedReturns += aggregateReturnQuantity;
+    unmatchedReturnUnits += aggregateReturnQuantity;
+    const limitation = "No return in the shipment group received a financial allocation because aggregate RMA quantity exceeds shipped quantity.";
+    metric.limitations.push(limitation);
+    exceptions.push(exception(
+      "RETURN_GROUP_QUANTITY_EXCEEDS_SHIPMENT",
+      "return_adjusted_trading",
+      "warning",
+      "Aggregate return quantity exceeds the uniquely matched shipment item",
+      `Shipment item ${allocationKey} has ${aggregateReturnQuantity} returned units against ${shipmentQuantity} shipped units; the complete group remains financially unallocated.`,
+      {
+        businessKey: allocationKey,
+        ean,
+        evidence: {
+          allocationPolicy: "all_or_none_by_unique_shipment_item",
+          shipmentId: candidate.shipment_id,
+          orderItemId: candidate.order_item_id,
+          shipmentQuantity,
+          aggregateReturnQuantity,
+          returnItems: groupedReturns,
+        },
+      },
+    ));
   }
 
   const unhandledRows = rows(operational.unhandledReturns);
@@ -639,6 +1154,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const offers = rows(currentState.offers);
   const offerEans = new Set<string>();
   const offerIds = new Set<string>();
+  const catalogOfferByEan = new Map<string, string>();
+  const catalogEanByOfferId = new Map<string, string>();
   let fbbOffers = 0;
   for (let offerIndex = 0; offerIndex < offers.length; offerIndex += 1) {
     const offer = offers[offerIndex];
@@ -647,14 +1164,27 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     assertContract(offerId && /^\d{13}$/.test(ean), "INVALID_CATALOG_OFFER", `Catalog offer ${offerIndex} is missing a valid offer ID or EAN.`);
     assertContract(!offerIds.has(offerId), "DUPLICATE_OFFER_ID", `Offer ID ${offerId} occurs more than once in the catalog source.`);
     assertContract(!offerEans.has(ean), "DUPLICATE_OFFER_EAN", `EAN ${ean} occurs more than once in the catalog source.`);
+    const commercialOfferEan = commercialEanByOfferId.get(offerId);
+    assertContract(
+      !commercialOfferEan || commercialOfferEan === ean,
+      "CATALOG_COMMERCIAL_OFFER_ID_CONFLICT",
+      `Catalog offer ${offerId} belongs to EAN ${ean}, but shipment evidence associates it with ${commercialOfferEan}.`,
+    );
     offerIds.add(offerId);
     offerEans.add(ean);
+    catalogOfferByEan.set(ean, offerId);
+    catalogEanByOfferId.set(offerId, ean);
     metricFor(ean);
     const stock = record(offer.stock);
     const product = record(offer.product);
     const pricing = record(offer.pricing);
     const bundlePrices = rows(pricing.bundlePrices);
-    const unitPrice = numberValue(bundlePrices.find(price => integer(price.quantity) === 1)?.unitPrice ?? bundlePrices[0]?.unitPrice);
+    const priceEntry = bundlePrices.find(price => price.quantity === 1) ?? bundlePrices[0];
+    const catalogUnitPrice = priceEntry?.unitPrice === null || priceEntry?.unitPrice === undefined
+      ? null
+      : strictJsonDecimal(priceEntry.unitPrice, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(priceEntry, "unitPrice") });
+    const catalogUnitPriceMinor = catalogUnitPrice ? moneyToMinor(catalogUnitPrice) : null;
+    if (catalogUnitPriceMinor !== null) assertMinorRange(catalogUnitPriceMinor, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`);
     const fulfilment = record(offer.fulfilment);
     if (text(fulfilment.method) === "FBB") fbbOffers += 1;
     const observedAt = generatedAt;
@@ -670,7 +1200,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       stock_managed_by_retailer: stock.managedByRetailer === null || stock.managedByRetailer === undefined ? null : Boolean(stock.managedByRetailer),
       condition_category: nullableText(record(offer.condition).category),
       bol_product_id: nullableText(product.bolProductId),
-      unit_price: unitPrice === null ? null : round(unitPrice, 2),
+      unit_price: catalogUnitPriceMinor === null ? null : minorToMajor(catalogUnitPriceMinor),
       fulfilment_method: nullableText(fulfilment.method),
       fulfilment_schedule: nullableText(fulfilment.schedule),
     };
@@ -700,38 +1230,107 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const ean = text(commission.ean);
     const result = record(commission.result);
     if (!/^\d{13}$/.test(ean) || integer(commission.status) !== 200) continue;
+    const estimateUnitPrice = strictJsonDecimal(commission.unitPrice, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(commission, "unitPrice") });
+    const estimateUnitPriceMinor = moneyToMinor(estimateUnitPrice);
+    assertMinorRange(estimateUnitPriceMinor, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`);
+    const fixedAmount = databaseDecimal(result.fixedAmount, "INVALID_COMMISSION_FIXED_AMOUNT", `Commission estimate ${ean} fixedAmount`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "fixedAmount") });
+    const percentage = databaseDecimal(result.percentage, "INVALID_COMMISSION_PERCENTAGE", `Commission estimate ${ean} percentage`, { allowNegative: false, scaleDigits: 6, minScaled: 0n, maxScaled: 100_000_000n, rawSource: rawJsonNumberSource(result, "percentage") });
+    const totalCost = databaseDecimal(result.totalCost, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCost`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "totalCost") });
+    const totalCostWithoutReduction = databaseDecimal(result.totalCostWithoutReduction, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCostWithoutReduction`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "totalCostWithoutReduction") });
     const fields = {
       ean,
       observed_at: generatedAt,
-      unit_price: round(numberValue(commission.unitPrice) || 0, 2),
-      fixed_amount: numberValue(result.fixedAmount),
-      percentage: numberValue(result.percentage),
-      total_cost: numberValue(result.totalCost),
-      total_cost_without_reduction: numberValue(result.totalCostWithoutReduction),
+      unit_price: minorToMajor(estimateUnitPriceMinor),
+      fixed_amount: fixedAmount?.text ?? null,
+      percentage: percentage?.text ?? null,
+      total_cost: totalCost?.text ?? null,
+      total_cost_without_reduction: totalCostWithoutReduction?.text ?? null,
       raw_result: result,
     };
     facts.commission_estimates.push(await fact(fields, `${ean}|${generatedAt}|${fields.unit_price}`, "catalog", `/currentState/commissions/${commissionIndex}`, generatedAt, now));
   }
 
-  const insightRows = rows(weekMetrics.offerInsights);
+  const insightRowsValue = weekMetrics.offerInsights;
+  assertContract(
+    Array.isArray(insightRowsValue) && insightRowsValue.every(isRecord),
+    "INVALID_INSIGHT_ROWS",
+    "insights.json offerInsights must be an array of objects.",
+  );
+  const insightRows = insightRowsValue as JsonRecord[];
+  const expectedInsightDates = new Set(
+    Array.from({ length: 7 }, (_, index) => addUtcDays(claim.periodStart, index) as string),
+  );
+  const hasExactWeek = (dates: Set<string> | undefined) =>
+    dates?.size === expectedInsightDates.size && [...expectedInsightDates].every(date => dates.has(date));
   const visitDatesByEan = new Map<string, Set<string>>();
   const buyBoxDatesByEan = new Map<string, Set<string>>();
   const seenVisitTotals = new Set<string>();
+  const seenBuyBoxDates = new Set<string>();
   const seenInsightCountries = new Set<string>();
   for (let insightIndex = 0; insightIndex < insightRows.length; insightIndex += 1) {
     const insight = insightRows[insightIndex];
     const ean = text(insight.ean);
     const offerId = text(insight.offerId);
     const metricName = text(insight.metric);
-    if (!/^\d{13}$/.test(ean) || !offerId || !["PRODUCT_VISITS", "BUY_BOX_PERCENTAGE"].includes(metricName)) continue;
-    const periods = rows(insight.periods);
+    assertContract(/^\d{13}$/.test(ean), "INVALID_INSIGHT_EAN", `Insight row ${insightIndex} has an invalid EAN.`);
+    assertContract(Boolean(offerId), "INVALID_INSIGHT_OFFER_ID", `Insight row ${insightIndex} has no offer ID.`);
+    assertContract(["PRODUCT_VISITS", "BUY_BOX_PERCENTAGE"].includes(metricName), "INVALID_INSIGHT_METRIC", `Insight row ${insightIndex} has unsupported metric ${metricName || "empty"}.`);
+    const catalogOfferId = catalogOfferByEan.get(ean);
+    const knownOfferEan = catalogEanByOfferId.get(offerId) || commercialEanByOfferId.get(offerId);
+    assertContract(
+      Boolean(catalogOfferId) || commercialEans.has(ean),
+      "INSIGHT_EAN_WITHOUT_SOURCE_IDENTITY",
+      `Insight row ${insightIndex} references EAN ${ean}, which is absent from validated catalog and commercial evidence.`,
+    );
+    assertContract(
+      !knownOfferEan || knownOfferEan === ean,
+      "INSIGHT_OFFER_ID_BELONGS_TO_DIFFERENT_EAN",
+      `Insight row ${insightIndex} uses offer ${offerId}, which belongs to validated EAN ${knownOfferEan}.`,
+    );
+    if (catalogOfferId) {
+      assertContract(
+        catalogOfferId === offerId,
+        "INSIGHT_OFFER_ID_MISMATCH",
+        `Insight row ${insightIndex} must use catalog offer ${catalogOfferId} for EAN ${ean}.`,
+      );
+    } else {
+      const commercialOfferIds = commercialOfferIdsByEan.get(ean);
+      assertContract(
+        commercialOfferIds && commercialOfferIds.size > 0,
+        "INSIGHT_COMMERCIAL_OFFER_IDENTITY_MISSING",
+        `Insight row ${insightIndex} references commercial-only EAN ${ean} without a validated shipment offer identity.`,
+      );
+      assertContract(
+        commercialOfferIds.size === 1,
+        "INSIGHT_COMMERCIAL_OFFER_IDENTITY_AMBIGUOUS",
+        `Commercial-only EAN ${ean} has conflicting shipment offer identities.`,
+      );
+      assertContract(
+        commercialOfferIds.has(offerId),
+        "INSIGHT_COMMERCIAL_OFFER_ID_MISMATCH",
+        `Insight row ${insightIndex} must use the unique validated shipment offer for commercial-only EAN ${ean}.`,
+      );
+    }
+    assertContract(
+      Array.isArray(insight.periods) && insight.periods.every(isRecord),
+      "INVALID_INSIGHT_PERIODS",
+      `${metricName} for EAN ${ean} must contain an array of period objects.`,
+    );
+    const periods = insight.periods as JsonRecord[];
     for (let periodIndex = 0; periodIndex < periods.length; periodIndex += 1) {
       const period = periods[periodIndex];
       const date = periodDate(period);
-      if (!date || date < claim.periodStart || date > claim.periodEnd) continue;
-      const total = numberValue(period.total ?? period.value ?? period.count);
+      assertContract(date, "INVALID_INSIGHT_DATE", `${metricName} for EAN ${ean} has an invalid date at period ${periodIndex}.`);
+      assertContract(expectedInsightDates.has(date), "OUT_OF_PERIOD_INSIGHT", `${metricName} for EAN ${ean} contains ${date}, outside ${claim.periodStart} through ${claim.periodEnd}.`);
+      if (metricName === "BUY_BOX_PERCENTAGE") {
+        const buyBoxDateKey = `${ean}|${date}`;
+        assertContract(!seenBuyBoxDates.has(buyBoxDateKey), "DUPLICATE_BUY_BOX_DATE", `Buy Box data for EAN ${ean} contains date ${date} more than once.`);
+        seenBuyBoxDates.add(buyBoxDateKey);
+      }
+      const totalValue = period.total ?? period.value ?? period.count;
       if (metricName === "PRODUCT_VISITS") {
-        assertContract(total !== null && Number.isInteger(total) && total >= 0, "INVALID_PRODUCT_VISIT_TOTAL", `Product visits for EAN ${ean} on ${date} must be a nonnegative integer.`);
+        assertContract(nonnegativeInt32(totalValue), "INVALID_PRODUCT_VISIT_TOTAL", `Product visits for EAN ${ean} on ${date} must be a nonnegative int32 JSON number.`);
+        const total = totalValue;
         const visitKey = `${ean}|${date}`;
         assertContract(!seenVisitTotals.has(visitKey), "DUPLICATE_PRODUCT_VISIT_DATE", `Product visits for EAN ${ean} contain date ${date} more than once.`);
         seenVisitTotals.add(visitKey);
@@ -740,9 +1339,15 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         visitDatesByEan.set(ean, dateSet);
         const fields = { offer_id: offerId, ean, metric_date: date, metric: metricName, country_code: null, is_total: true, value: total };
         facts.offer_insight_daily.push(await fact(fields, `${offerId}|${date}|${metricName}|TOTAL`, "insights", `/weekMetrics/offerInsights/${insightIndex}/periods/${periodIndex}`, date, now));
-        metricFor(ean).visits = (metricFor(ean).visits || 0) + integer(total);
+        metricFor(ean).visits = (metricFor(ean).visits || 0) + total;
       }
-      const countries = rows(period.countries);
+      const countriesValue = period.countries ?? [];
+      assertContract(
+        Array.isArray(countriesValue) && countriesValue.every(isRecord),
+        "INVALID_INSIGHT_COUNTRIES",
+        `${metricName} for EAN ${ean} on ${date} must contain an array of country objects.`,
+      );
+      const countries = countriesValue as JsonRecord[];
       let validCountryCount = 0;
       for (let countryIndex = 0; countryIndex < countries.length; countryIndex += 1) {
         const country = countries[countryIndex];
@@ -777,7 +1382,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const rankRows = rows(record(rankCall.data).ranks ?? record(rankCall.sample).ranks);
     if (integer(rankCall.status) !== 200) continue;
     assertContract(offerEans.has(ean), "UNEXPECTED_RANK_EAN", `Rank call ${callIndex} references EAN ${ean}, which is not in the catalog.`);
-    assertContract(rankDate && rankDate >= claim.periodStart && rankDate <= claim.periodEnd, "OUT_OF_PERIOD_RANK_CALL", `Rank call ${callIndex} is outside ${claim.periodStart} through ${claim.periodEnd}.`);
+    assertContract(rankDate, "INVALID_RANK_DATE", `Rank call ${callIndex} must use a canonical calendar-valid YYYY-MM-DD date.`);
+    assertContract(rankDate >= claim.periodStart && rankDate <= claim.periodEnd, "OUT_OF_PERIOD_RANK_CALL", `Rank call ${callIndex} is outside ${claim.periodStart} through ${claim.periodEnd}.`);
     assertContract(EXPECTED_RANK_LOCALES.has(locale), "UNEXPECTED_RANK_LOCALE", `Rank call ${callIndex} uses unsupported locale ${locale}.`);
     assertContract(rankType === "SEARCH", "UNEXPECTED_RANK_TYPE", `Rank call ${callIndex} uses unsupported type ${rankType}.`);
     const combination = `${ean}|${rankDate}|${locale}`;
@@ -796,7 +1402,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     }
   }
 
-  const invoices = rows(settlement.invoices);
+  const invoices = contractRows(settlement.invoices, "INVALID_INVOICE_HEADERS", "settlement.invoices");
   const seenInvoiceIds = new Set<string>();
   for (let invoiceIndex = 0; invoiceIndex < invoices.length; invoiceIndex += 1) {
     const invoice = invoices[invoiceIndex];
@@ -806,30 +1412,46 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     seenInvoiceIds.add(invoiceId);
     const period = record(invoice.invoicePeriod);
     const totals = record(invoice.legalMonetaryTotal);
-    const payable = totals.payableAmount;
-    const taxExclusive = totals.taxExclusiveAmount;
-    const taxInclusive = totals.taxInclusiveAmount;
+    const payable = databaseDecimal(
+      totals.payableAmount,
+      "INVALID_INVOICE_PAYABLE_AMOUNT",
+      `Invoice ${invoiceId} payableAmount`,
+      { required: true, scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "payableAmount") },
+    );
+    assertContract(payable, "INVALID_INVOICE_PAYABLE_AMOUNT", `Invoice ${invoiceId} payableAmount is required.`);
+    const taxExclusive = databaseDecimal(
+      totals.taxExclusiveAmount,
+      "INVALID_INVOICE_TAX_EXCLUSIVE_AMOUNT",
+      `Invoice ${invoiceId} taxExclusiveAmount`,
+      { scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "taxExclusiveAmount") },
+    );
+    const taxInclusive = databaseDecimal(
+      totals.taxInclusiveAmount,
+      "INVALID_INVOICE_TAX_INCLUSIVE_AMOUNT",
+      `Invoice ${invoiceId} taxInclusiveAmount`,
+      { scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "taxInclusiveAmount") },
+    );
     const fields = {
       invoice_id: invoiceId,
       issue_date: isoDate(invoice.issueDate),
       invoice_type: nullableText(invoice.invoiceType),
       period_start: isoDate(period.startDate),
       period_end: isoDate(period.endDate),
-      payable_amount: amount(payable),
-      tax_exclusive_amount: amount(taxExclusive),
-      tax_inclusive_amount: amount(taxInclusive),
-      currency: currency(payable) || currency(taxExclusive),
+      payable_amount: payable.text,
+      tax_exclusive_amount: taxExclusive?.text ?? null,
+      tax_inclusive_amount: taxInclusive?.text ?? null,
+      currency: currency(totals.payableAmount) || currency(totals.taxExclusiveAmount),
       raw_header: invoice,
     };
     facts.invoice_headers.push(await fact(fields, invoiceId, "financial", `/settlement/invoices/${invoiceIndex}`, fields.issue_date || generatedAt, now));
   }
 
-  const specifications = rows(settlement.invoiceSpecifications);
+  const specifications = contractRows(settlement.invoiceSpecifications, "INVALID_INVOICE_SPECIFICATIONS", "settlement.invoiceSpecifications");
   for (let specificationIndex = 0; specificationIndex < specifications.length; specificationIndex += 1) {
     const specification = specifications[specificationIndex];
     const invoiceId = text(specification.invoiceId);
     assertContract(invoiceId, "INVALID_INVOICE_SPECIFICATION", `Invoice specification ${specificationIndex} has no invoice ID.`);
-    const lines = rows(specification.lines);
+    const lines = contractRows(specification.lines, "INVALID_INVOICE_SPECIFICATION_LINES", `Invoice ${invoiceId} specification lines`);
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
       const parsed = invoiceLineFields(lines[lineIndex], invoiceId, lineIndex);
       assertContract(parsed.invoice_line_ref, "INVALID_INVOICE_TRANSACTION", `Invoice ${invoiceId} contains a transaction without a line reference.`);
@@ -841,21 +1463,28 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }
 
   const commercialStatus = text(record(sourceDatasetStatuses.commercial).status);
+  const catalogStatus = text(record(sourceDatasetStatuses.catalog).status);
   const insightsStatus = text(record(sourceDatasetStatuses.insights).status);
   const financialStatus = text(record(sourceDatasetStatuses.financial).status);
   const shipmentReady = commercialStatus === "complete" && invalidShipmentDetails === 0;
+  const catalogReady = catalogStatus === "complete";
+  const insightsReady = insightsStatus === "complete";
   qualityChecks.push(check("SHIPMENT_DETAILS_VALID", "shipment_facts", "error", shipmentReady ? "passed" : "failed", shipmentReady ? "All shipment details are valid and complete." : "One or more shipment details are missing or invalid.", { datasetStatus: "complete", invalidDetails: 0 }, { datasetStatus: commercialStatus, invalidDetails: invalidShipmentDetails }));
+  qualityChecks.push(check("CATALOG_SOURCE_VALID", "catalog_offers", "error", catalogReady ? "passed" : "failed", catalogReady ? "The complete current-offer catalog defines the weekly product universe." : "The current-offer catalog is incomplete, so catalog-dependent coverage cannot be proven.", { datasetStatus: "complete" }, { datasetStatus: catalogStatus, offerCount: offers.length }));
   qualityChecks.push(check("RETURN_MATCH_COVERAGE", "return_adjusted_trading", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "warning" : "info", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "warning" : "passed", unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "Some registered returns remain outside the provisional financial adjustment." : "Every registered return was linked exactly once.", { unmatchedUnits: 0, ambiguousUnits: 0 }, { unmatchedUnits: unmatchedReturnUnits, ambiguousUnits: ambiguousReturnUnits }));
   const expectedRankCalls = offerEans.size * 7 * EXPECTED_RANK_LOCALES.size;
-  const ranksReady = rankCombinations.size === expectedRankCalls && rankCalls.every(row => integer(row.status) === 200);
+  const ranksReady = catalogReady && insightsReady && rankCombinations.size === expectedRankCalls && rankCalls.every(row => integer(row.status) === 200);
   qualityChecks.push(check("RANK_CALL_COVERAGE", "keyword_ranks", "error", ranksReady ? "passed" : "failed", ranksReady ? "All expected EAN/date/locale rank calls are present." : "Rank-call coverage is incomplete.", { combinations: expectedRankCalls }, { combinations: rankCombinations.size, rows: rankCalls.length, sourceDatasetStatus: insightsStatus }));
-  const visitCoverageReady = offers.every(offer => (visitDatesByEan.get(text(offer.ean))?.size || 0) === 7);
-  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every offer has seven product-visit dates." : "At least one offer is missing product-visit dates.", { datesPerOffer: 7 }, Object.fromEntries([...visitDatesByEan].map(([ean, dates]) => [ean, dates.size]))));
-  const buyBoxCoverageReady = offers.every(offer => (buyBoxDatesByEan.get(text(offer.ean))?.size || 0) === 7);
-  qualityChecks.push(check("BUY_BOX_DATE_COVERAGE", "buy_box", "warning", buyBoxCoverageReady ? "passed" : "warning", buyBoxCoverageReady ? "Every offer has seven Buy Box dates." : "At least one offer is missing Buy Box dates; missing countries remain missing rather than zero.", { datesPerOffer: 7 }, Object.fromEntries([...buyBoxDatesByEan].map(([ean, dates]) => [ean, dates.size]))));
+  const weeklyProductEans = [...productMetrics.keys()];
+  const visitCoverageReady = catalogReady && insightsReady && weeklyProductEans.every(ean => hasExactWeek(visitDatesByEan.get(ean)));
+  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every weekly product has exactly the seven claimed product-visit dates." : "At least one weekly product is missing an exact claimed-week visit date set or a required source dataset is incomplete.", { dates: [...expectedInsightDates], sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries(weeklyProductEans.map(ean => [ean, [...(visitDatesByEan.get(ean) || [])].sort()])) }));
+  const buyBoxInputsReady = catalogReady && insightsReady;
+  const buyBoxCoverageReady = buyBoxInputsReady && offers.every(offer => hasExactWeek(buyBoxDatesByEan.get(text(offer.ean))));
+  const buyBoxResult = !buyBoxInputsReady ? "failed" : buyBoxCoverageReady ? "passed" : "warning";
+  qualityChecks.push(check("BUY_BOX_DATE_COVERAGE", "buy_box", buyBoxInputsReady ? "warning" : "error", buyBoxResult, buyBoxCoverageReady ? "Every current offer has seven Buy Box dates." : "At least one current offer is missing Buy Box dates or a required source dataset is incomplete; missing countries remain missing rather than zero.", { datesPerOffer: 7, sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries([...buyBoxDatesByEan].map(([ean, dates]) => [ean, dates.size])) }));
   const invoicesReady = financialStatus === "complete";
   qualityChecks.push(check("INVOICE_SOURCE_VALID", "invoices", "error", invoicesReady ? "passed" : "failed", invoicesReady ? "Invoice list and requested specifications passed the source contract." : "The financial source dataset is incomplete.", { datasetStatus: "complete" }, { datasetStatus: financialStatus, invoiceCount: invoices.length, transactionCount: facts.invoice_transactions.length }));
-  qualityChecks.push(check("FBB_INVENTORY_APPLICABILITY", "fbb_inventory", "info", fbbOffers > 0 ? "passed" : "not_applicable", fbbOffers > 0 ? "FBB offers exist, so FBB inventory observations are applicable." : "All current offers are FBR; FBB inventory is not applicable.", null, { fbbOffers, totalOffers: offers.length }));
+  qualityChecks.push(check("FBB_INVENTORY_APPLICABILITY", "fbb_inventory", catalogReady ? "info" : "error", !catalogReady ? "failed" : fbbOffers > 0 ? "passed" : "not_applicable", !catalogReady ? "FBB applicability cannot be established because the catalog source is incomplete." : fbbOffers > 0 ? "FBB offers exist, so FBB inventory observations are applicable." : "All current offers are FBR; FBB inventory is not applicable.", null, { catalogDatasetStatus: catalogStatus, fbbOffers, totalOffers: offers.length }));
   const allShipmentCountriesPresent = facts.outbound_shipments.every(row => Boolean(row.country_code));
   qualityChecks.push(check("SHIPMENT_COUNTRY_COVERAGE", "country_split", "warning", allShipmentCountriesPresent ? "passed" : "warning", allShipmentCountriesPresent ? "Every shipment has a country code." : "Country reporting remains limited because at least one shipment has no country code.", { missing: 0 }, { missing: facts.outbound_shipments.filter(row => !row.country_code).length }));
   qualityChecks.push(check("ORDER_COHORT_CONVERSION", "order_cohort_conversion", "info", "not_applicable", "Order-cohort conversion is not produced from same-week visits and shipments.", null, null));
@@ -864,11 +1493,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     { data_product: "shipment_facts", status: shipmentReady ? "ready" : "not_ready", limitations: shipmentReady ? [] : ["Shipment source data is incomplete."], is_active: shipmentReady },
     { data_product: "registered_return_events", status: commercialStatus === "complete" ? "ready" : "not_ready", limitations: [], is_active: commercialStatus === "complete" },
     { data_product: "return_adjusted_trading", status: !shipmentReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 ? "ready_with_limits" : "ready", limitations: unmatchedReturnUnits + ambiguousReturnUnits > 0 ? ["Unmatched or ambiguous returns are excluded from the provisional value adjustment."] : [], is_active: shipmentReady },
-    { data_product: "product_visits", status: visitCoverageReady ? "ready" : "not_ready", limitations: visitCoverageReady ? [] : ["Not every offer has seven aligned visit dates."], is_active: visitCoverageReady },
+    { data_product: "catalog_offers", status: catalogReady ? "ready" : "not_ready", limitations: catalogReady ? [] : ["The current-offer catalog source is incomplete."], is_active: catalogReady },
+    { data_product: "product_visits", status: visitCoverageReady ? "ready" : "not_ready", limitations: visitCoverageReady ? [] : ["Not every weekly product has seven aligned visit dates from complete catalog and insights sources."], is_active: visitCoverageReady },
     { data_product: "keyword_ranks", status: ranksReady ? "ready" : "not_ready", limitations: ranksReady ? [] : ["Rank-call coverage is incomplete."], is_active: ranksReady },
-    { data_product: "buy_box", status: buyBoxCoverageReady ? "ready" : "ready_with_limits", limitations: buyBoxCoverageReady ? [] : ["At least one Buy Box date is missing."], is_active: true },
+    { data_product: "buy_box", status: !buyBoxInputsReady ? "not_ready" : buyBoxCoverageReady ? "ready" : "ready_with_limits", limitations: buyBoxCoverageReady ? [] : [buyBoxInputsReady ? "At least one Buy Box date is missing." : "The catalog or insights source is incomplete."], is_active: buyBoxInputsReady },
     { data_product: "invoices", status: invoicesReady ? "ready" : "not_ready", limitations: invoicesReady ? [] : ["The financial source dataset is incomplete."], is_active: invoicesReady },
-    { data_product: "fbb_inventory", status: fbbOffers > 0 ? "ready" : "not_applicable", limitations: fbbOffers > 0 ? [] : ["All current offers use FBR."], is_active: true },
+    { data_product: "fbb_inventory", status: !catalogReady ? "not_ready" : fbbOffers > 0 ? "ready" : "not_applicable", limitations: !catalogReady ? ["The catalog source is incomplete."] : fbbOffers > 0 ? [] : ["All current offers use FBR."], is_active: catalogReady },
     { data_product: "country_split", status: allShipmentCountriesPresent ? "ready" : "ready_with_limits", limitations: allShipmentCountriesPresent ? [] : ["At least one shipment has no country code."], is_active: true },
     { data_product: "order_cohort_conversion", status: "not_ready", limitations: ["Same-week shipped units divided by visits is not cohort conversion."], is_active: false },
     { data_product: "trading_units_per_visit", status: shipmentReady && visitCoverageReady ? "ready_with_limits" : "not_ready", limitations: ["This is a same-week trading proxy, not order-cohort conversion."], is_active: shipmentReady && visitCoverageReady },
@@ -880,12 +1510,37 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }));
 
   const weeklyMetrics = [...productMetrics.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ean, metric]) => {
-    const grossGms = round(metric.grossGms, 2);
-    const grossCommission = round(metric.grossCommission, 2);
-    const linkedReturnGms = round(metric.linkedReturnGms, 2);
-    const linkedReturnCommission = round(metric.linkedReturnCommission, 2);
-    const provisionalNetGms = round(grossGms - linkedReturnGms, 2);
-    const provisionalAfterCommission = round(provisionalNetGms - (grossCommission - linkedReturnCommission), 2);
+    assertContract(
+      [metric.grossUnits, metric.registeredReturns, metric.linkedReturns, metric.unlinkedReturns]
+        .every(nonnegativeInt32)
+        && (metric.visits === null || nonnegativeInt32(metric.visits)),
+      "WEEKLY_INTEGER_OUT_OF_RANGE",
+      `Weekly integer aggregate for EAN ${ean} exceeds PostgreSQL int32 or is invalid.`,
+    );
+    assertContract(
+      metric.linkedReturns + metric.unlinkedReturns === metric.registeredReturns,
+      "RETURN_QUANTITY_IDENTITY_MISMATCH",
+      `Return quantity identity does not reconcile for EAN ${ean}.`,
+    );
+    const grossGmsMinor = metric.grossGmsMinor;
+    const grossCommissionMinor = metric.grossCommissionMinor;
+    const linkedReturnGmsMinor = metric.linkedReturnGmsMinor;
+    const linkedReturnCommissionMinor = metric.linkedReturnCommissionMinor;
+    const provisionalNetGmsMinor = grossGmsMinor - linkedReturnGmsMinor;
+    const provisionalAfterCommissionMinor = provisionalNetGmsMinor
+      - (grossCommissionMinor - linkedReturnCommissionMinor);
+    assertMinorRange(grossGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly gross GMS for EAN ${ean}`);
+    assertMinorRange(grossCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly gross commission for EAN ${ean}`);
+    assertMinorRange(linkedReturnGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly linked return GMS for EAN ${ean}`);
+    assertMinorRange(linkedReturnCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly linked return commission for EAN ${ean}`);
+    assertMinorRange(provisionalNetGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly provisional net GMS for EAN ${ean}`, true);
+    assertMinorRange(provisionalAfterCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly provisional revenue after commission for EAN ${ean}`, true);
+    const grossGms = minorToMajor(grossGmsMinor);
+    const grossCommission = minorToMajor(grossCommissionMinor);
+    const linkedReturnGms = minorToMajor(linkedReturnGmsMinor);
+    const linkedReturnCommission = minorToMajor(linkedReturnCommissionMinor);
+    const provisionalNetGms = minorToMajor(provisionalNetGmsMinor);
+    const provisionalAfterCommission = minorToMajor(provisionalAfterCommissionMinor);
     const reportedVisits = visitCoverageReady ? metric.visits : null;
     const visitsStatus = reportedVisits === null ? "not_ready" : "ready";
     const returnsStatus = metric.unlinkedReturns > 0 ? "ready_with_limits" : "ready";
@@ -901,7 +1556,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       linked_return_commission: linkedReturnCommission,
       provisional_net_gms: provisionalNetGms,
       provisional_revenue_after_commission: provisionalAfterCommission,
-      gross_shipped_asp: metric.grossUnits ? round(grossGms / metric.grossUnits, 4) : null,
+      gross_shipped_asp: metric.grossUnits ? scaledRatioToNumber(grossGmsMinor, BigInt(metric.grossUnits) * 100n, 4) : null,
       product_visits: reportedVisits,
       trading_units_per_visit: reportedVisits ? round(metric.grossUnits / reportedVisits, 6) : null,
       commercial_status: shipmentReady ? "ready" : "not_ready",
@@ -913,23 +1568,32 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         "Trading units per visit is not order-cohort conversion.",
       ])],
       calculation_trace: {
-        grossShippedGms: `${metric.grossUnits} shipped units valued from outbound shipment lines`,
-        linkedReturnGms: `${metric.linkedReturns} return units matched by exact order ID and EAN`,
-        provisionalNetGms: `${grossGms} - ${linkedReturnGms} = ${provisionalNetGms}`,
-        revenueAfterCommission: `${provisionalNetGms} - (${grossCommission} - ${linkedReturnCommission}) = ${provisionalAfterCommission}`,
+        roundingPolicy: "Shipment lines and grouped return allocations use integer minor units with deterministic half-up division.",
+        minorUnits: {
+          grossShippedGms: grossGmsMinor.toString(),
+          grossCommission: grossCommissionMinor.toString(),
+          linkedReturnGms: linkedReturnGmsMinor.toString(),
+          linkedReturnCommission: linkedReturnCommissionMinor.toString(),
+          provisionalNetGms: provisionalNetGmsMinor.toString(),
+          provisionalRevenueAfterCommission: provisionalAfterCommissionMinor.toString(),
+        },
+        grossShippedGms: `${metric.grossUnits} shipped units valued from exact shipment-line minor units`,
+        linkedReturnGms: `${metric.linkedReturns} return units allocated from exact shipment-line minor units`,
+        provisionalNetGms: "gross shipped GMS minor units - linked return GMS minor units",
+        revenueAfterCommission: "provisional net GMS minor units - (gross commission minor units - linked return commission minor units)",
       },
     };
   });
-  const reportStatus = !shipmentReady || !visitCoverageReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 || !buyBoxCoverageReady || !allShipmentCountriesPresent ? "ready_with_limits" : "ready";
+  const reportStatus = !shipmentReady || !catalogReady || !visitCoverageReady ? "not_ready" : unmatchedReturnUnits + ambiguousReturnUnits > 0 || !buyBoxCoverageReady || !allShipmentCountriesPresent ? "ready_with_limits" : "ready";
 
   const completedAt = new Date().toISOString();
   const steps = [
     { step_code: "source_validation", status: "passed", input_count: EXPECTED_ARTIFACTS.length + 1, output_count: loaded.evidence.length, started_at: now, completed_at: completedAt, detail: { sourceContractVersion: SOURCE_CONTRACT_VERSION } },
     { step_code: "commercial", status: shipmentReady ? "passed" : "failed", input_count: shipmentDetails.length + returnRows.length, output_count: facts.outbound_shipment_items.length + facts.return_items.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "catalog", status: "passed", input_count: offers.length, output_count: facts.offer_observations.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "insights", status: visitCoverageReady && ranksReady ? "passed" : "warning", input_count: insightRows.length + rankCalls.length, output_count: facts.offer_insight_daily.length + facts.keyword_rank_daily.length, started_at: now, completed_at: completedAt, detail: {} },
+    { step_code: "catalog", status: catalogReady ? "passed" : "failed", input_count: offers.length, output_count: facts.offer_observations.length, started_at: now, completed_at: completedAt, detail: { sourceDatasetStatus: catalogStatus } },
+    { step_code: "insights", status: !visitCoverageReady || !ranksReady || !buyBoxInputsReady ? "failed" : !buyBoxCoverageReady ? "warning" : "passed", input_count: insightRows.length + rankCalls.length, output_count: facts.offer_insight_daily.length + facts.keyword_rank_daily.length, started_at: now, completed_at: completedAt, detail: { sourceDatasetStatus: insightsStatus } },
     { step_code: "financial", status: invoicesReady ? "passed" : "failed", input_count: invoices.length, output_count: facts.invoice_transactions.length, started_at: now, completed_at: completedAt, detail: {} },
-    { step_code: "quality", status: qualityChecks.some(row => row.result === "failed") ? "warning" : qualityChecks.some(row => row.result === "warning") ? "warning" : "passed", input_count: qualityChecks.length, output_count: exceptions.length, started_at: now, completed_at: completedAt, detail: {} },
+    { step_code: "quality", status: qualityChecks.some(row => row.result === "failed") ? "failed" : qualityChecks.some(row => row.result === "warning") ? "warning" : "passed", input_count: qualityChecks.length, output_count: exceptions.length, started_at: now, completed_at: completedAt, detail: {} },
     { step_code: "publication", status: "passed", input_count: Object.values(facts).reduce((sum, value) => sum + value.length, 0), output_count: weeklyMetrics.length, started_at: now, completed_at: completedAt, detail: { atomic: true } },
   ];
 

@@ -22,6 +22,14 @@ const commissionDictionaryFix = readFileSync(
   new URL('../supabase/migrations/20260929165852_correct_retailer_commission_definitions.sql', import.meta.url),
   'utf8',
 );
+const transformV2 = readFileSync(
+  new URL('../supabase/migrations/20260930155322_retailer_transform_v2_contract.sql', import.meta.url),
+  'utf8',
+);
+const transformWorker = readFileSync(
+  new URL('../supabase/functions/bol-retailer-transform/index.ts', import.meta.url),
+  'utf8',
+);
 
 test('pipeline health counts checks and exceptions without join multiplication', () => {
   assert.match(managementViews, /count\(distinct qc\.id\).*qc\.result = 'failed'/s);
@@ -53,7 +61,7 @@ test('artifact integrity is independent from intentional parsing scope', () => {
 });
 
 test('every published weekly measure has interpretation metadata', () => {
-  const metricCodes = [...metricDictionary.matchAll(/^\s{2}\(\n\s{4}'([a-z_]+)',/gm)].map(match => match[1]);
+  const metricCodes = [...metricDictionary.matchAll(/^\s{2}\(\r?\n\s{4}'([a-z_]+)',/gm)].map(match => match[1]);
   const expected = [
     'gross_shipped_units',
     'gross_shipped_gms',
@@ -86,4 +94,27 @@ test('commission definitions treat shipment-line commission as a total amount', 
   assert.match(commissionDictionaryFix, /sum\(shipment_line_commission_amount\)/);
   assert.match(commissionDictionaryFix, /shipment line commission \/ matched shipment quantity/);
   assert.doesNotMatch(commissionDictionaryFix, /quantity_shipped \* shipment_line_commission/);
+});
+
+test('transform v2 is versioned consistently and backfills only the latest source per week', () => {
+  assert.match(transformWorker, /const TRANSFORM_VERSION = "retailer-transform-v2"/);
+  assert.doesNotMatch(transformWorker, /const TRANSFORM_VERSION = "retailer-transform-v1"/);
+  assert.match(transformV2, /'retailer-transform-v2'/);
+  assert.doesNotMatch(transformV2, /'retailer-transform-v1'/);
+  assert.match(transformV2, /select distinct on \(run\.iso_year, run\.iso_week\)/);
+  assert.match(transformV2, /run\.completed_at desc nulls last/);
+  assert.match(transformV2, /run\.id desc/);
+  assert.match(transformV2, /on conflict \(source_system, source_run_id, transform_version\) do nothing/);
+  assert.match(transformV2, /status in \('queued', 'processing', 'retry_wait'\)/);
+  assert.match(transformV2, /queue_length from pgmq\.metrics\('bol_retailer_transform'\)/);
+});
+
+test('a later data-product revision cannot replace a strictly better active revision', () => {
+  assert.match(transformV2, /create trigger keep_best_active_data_product_revision/);
+  assert.match(transformV2, /when 'ready' then 3/);
+  assert.match(transformV2, /when 'ready_with_limits' then 2/);
+  assert.match(transformV2, /when 'not_applicable' then 1/);
+  assert.match(transformV2, /end > new_readiness/);
+  assert.match(transformV2, /set is_active = false,\s+activated_at = null\s+where id = new\.id/s);
+  assert.match(transformV2, /set is_active = true,\s+activated_at = coalesce\(activated_at, now\(\)\)\s+where id = better_revision_id/s);
 });

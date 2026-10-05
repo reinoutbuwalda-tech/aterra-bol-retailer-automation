@@ -1,6 +1,6 @@
 # Bol Retailer data foundation
 
-Updated: 2026-09-29.
+Updated: 2026-09-30.
 
 ## Purpose
 
@@ -19,7 +19,7 @@ Bol Retailer API
   -> seven immutable JSON files in private Storage
   -> source run reaches complete or partial
   -> durable pgmq message
-  -> transform verifies manifest, bytes, and SHA-256 hashes
+  -> transform verifies the claimed run, manifest contract, artifact envelopes, bytes, and SHA-256 hashes
   -> normalized facts plus exact source pointers
   -> independent data-product readiness decisions
   -> immutable weekly report revision
@@ -61,8 +61,8 @@ into business tables unless a field is useful for a business decision or audit.
 
 ### `reporting`: what is currently usable
 
-- `data_product_revisions`: independent readiness for shipments, returns, visits,
-  ranks, Buy Box, invoices, country split, and derived trading metrics.
+- `data_product_revisions`: independent readiness for catalog offers, shipments,
+  returns, visits, ranks, Buy Box, invoices, country split, and derived trading metrics.
 - `weekly_report_revisions`: immutable versions of a weekly report.
 - `weekly_revision_sources`: the exact data-product revisions used by a report.
 - `weekly_product_metrics`: one row for every valid mapped offer, including zero-
@@ -86,12 +86,12 @@ table access; the service role performs controlled pipeline writes.
 
 | Metric | Plain-English rule |
 | --- | --- |
-| Gross shipped units | Quantity in outbound shipment lines dated in the week. |
+| Gross shipped units | Positive PostgreSQL int32 `quantityShipped` JSON numbers in outbound shipment lines dated in the week; coercible strings, fractions, values above 2,147,483,647, and overflowing weekly sums are rejected. |
 | Gross shipped GMS | Shipped quantity multiplied by shipment-line unit price. |
-| Gross commission | Shipped quantity multiplied by shipment-line commission. |
-| Registered returns | Return events registered in the week. |
-| Linked returns | Return quantity matched by exact order ID and EAN to a weekly shipment. |
-| Linked return GMS | Value removed only for linked return quantity. |
+| Gross commission | Sum of the commission amount already reported for each shipment line. |
+| Registered returns | Return events registered in the week whose `expectedQuantity` is a positive PostgreSQL int32 JSON number; strings, fractions, values above 2,147,483,647, and overflowing aggregates are rejected. |
+| Linked returns | All RMAs matched by exact order ID and EAN to one unique weekly shipment item, but only when aggregate group quantity does not exceed shipped quantity. Conflicting groups remain wholly unallocated. |
+| Linked return GMS | Exact shipment-line gross allocated by the accepted group quantity ratio, so a full return reverses the original gross exactly and overflow remains an explicit exception. |
 | Provisional net GMS | Gross shipped GMS minus linked return GMS. |
 | Provisional revenue after commission | Provisional net GMS minus net commission after linked returns. |
 | Gross shipped ASP | Gross shipped GMS divided by gross shipped units, before returns. |
@@ -99,7 +99,16 @@ table access; the service role performs controlled pipeline writes.
 | Trading units per visit | Gross shipped units divided by same-week visits. This is not cohort conversion. |
 
 An unmatched return stays visible as an exception and does not silently reduce revenue.
-Settlement remains provisional until invoice and accounting reconciliation is approved.
+Shipment-line gross and commission are converted to integer minor units with decimal
+parsing, then aggregated without binary floating-point arithmetic. Grouped partial
+returns use deterministic half-up minor-unit allocation. Published monetary fields come
+directly from those integer identities, and the calculation trace preserves every minor-
+unit input. Provisional revenue after commission may be negative when exact commission
+exceeds provisional net GMS; it is retained rather than clamped. Required invoice
+monetary values use exact field-specific decimal contracts. Malformed required or
+present optional values reject the transform, while absent optional values remain null;
+a complete financial source cannot stay `ready` after malformed values. Settlement
+remains provisional until invoice and accounting reconciliation is approved.
 
 ## Readiness states
 
@@ -112,6 +121,30 @@ Settlement remains provisional until invoice and accounting reconciliation is ap
 A partial source run does not make every output unusable. For example, shipment facts
 can be ready while visits are not ready. Incomplete visits remain daily evidence; the
 weekly visit total and units-per-visit are `null`, never zero or a partial sum.
+
+Catalog completeness is checked separately. The catalog defines the current offer
+universe, so an incomplete catalog makes catalog offers, visits, ranks, Buy Box, and
+FBB inventory `not_ready`. Every insight for a catalog EAN must use that EAN's exact
+validated offer ID, and an offer ID associated by catalog or shipment evidence with
+another EAN is rejected. An EAN absent from the current catalog may retain insight
+evidence only when shipment facts establish one unique exact offer identity. Unknown or
+conflicting shipment offer IDs are rejected, and return-only evidence cannot verify an
+offer identity. An insight-only foreign EAN is rejected. Visit coverage is checked
+against every EAN that appears in
+the weekly report, including a product that shipped or returned during the week but is
+no longer in the current-offer list. One missing product therefore cannot hide behind
+otherwise complete current offers.
+
+These stricter rules are labeled `retailer-transform-v2`. Existing `v1` revisions stay
+immutable and traceable. A v2 rollout first deploys the compatible worker while the
+queue is empty, then changes the enqueue trigger, and finally queues only the latest
+contract-3.0 source for each historical week. Existing report-promotion guards keep a
+better active report when a v2 historical candidate has lower readiness.
+
+The same protection applies independently to each data product. A later revision only
+becomes current when it is at least as usable as the current one; for example,
+`ready_with_limits` cannot replace `ready`. The weaker revision is still retained and
+linked to its report for audit.
 
 A later rerun can create a new revision without automatically becoming current. The
 database keeps the existing active report when the new revision has lower readiness.

@@ -1,15 +1,17 @@
 # Bol Retailer transform worker
 
-Transforms verified Retailer API source contract `3.0` snapshots into Aterra's private Supabase data foundation.
+Transforms verified Retailer API source contract `3.0` snapshots into Aterra's private Supabase data foundation. Transform `v2` adds strict manifest-envelope validation and complete-catalog readiness rules without rewriting historical `v1` lineage.
 
 ## Processing contract
 
 1. A terminal source run is queued in `bol_retailer_transform`.
 2. The worker claims one message and leases its transform run.
 3. It downloads the manifest and six artifacts from private Storage.
-4. Every stored byte length and SHA-256 hash is verified before parsing.
-5. Facts, lineage sightings, checks, exceptions, and reporting revisions publish in one database transaction.
-6. The queue message is archived only after successful publication.
+4. The claimed run, exact storage paths, ISO week, source status, dataset-status shape,
+   and parsed artifact envelopes must agree.
+5. Every stored byte length and SHA-256 hash is verified before parsing.
+6. Facts, lineage sightings, checks, exceptions, and reporting revisions publish in one database transaction.
+7. The queue message is archived only after successful publication.
 
 Transient failures use bounded backoff and stop after five attempts with
 `RETRY_EXHAUSTED`. Permanent source-contract failures reject immediately. Rejected
@@ -21,11 +23,19 @@ The function uses a custom `x-aterra-cron-token` check, so Supabase gateway JWT 
 
 - EAN is the first product key.
 - Every valid catalog offer receives a weekly row, even when activity is zero.
-- Sales come from outbound shipment items.
-- Returns remain registered events and reduce provisional value only after an exact order-ID and EAN match.
-- Gross ASP is calculated before returns.
+- An incomplete catalog blocks catalog-dependent products rather than shrinking the
+  product universe and accidentally passing coverage.
+- Sales come from outbound shipment items. `quantityShipped` and return `expectedQuantity` must be positive PostgreSQL int32 JSON numbers; integer/fractional/exponent-form strings, signed or whitespace-padded strings, zero, negatives, nonfinite values, values above 2,147,483,647, and overflowing weekly aggregates are rejected before conversion or fact creation.
+- Shipment unit price and commission must be finite nonnegative JSON numbers in canonical non-exponent decimal form and within PostgreSQL `numeric(14,2)`. Required invoice line/payable amounts and optional invoice quantity, price, tax, and percentage fields use strict field-specific `numeric(14,4)`/`numeric(14,6)` contracts; malformed optional values fail rather than becoming zero, while absent optional values remain null.
+- Tolerant numeric normalization remains only for nonfinancial HTTP/status, storage metadata, catalog stock, rank, and country-insight fields; it never feeds published money or weekly integer aggregates.
+- Returns remain registered events. All RMAs that map to one unique shipment item are evaluated as one deterministic group. When aggregate return quantity exceeds shipped quantity, the whole group remains financially unallocated with an explicit exception; otherwise valuation uses the exact shipment-line gross and commission totals, proportionally for partial returns.
+- Shipment-line gross and commission use exact integer minor units. Grouped partial returns use deterministic half-up allocation; full returns reverse the exact line totals, and negative provisional revenue after commission remains negative rather than being clamped.
+- Malformed insight rows and any insight date outside the claimed week fail closed. Date-only insight and rank fields must be canonical calendar-valid `YYYY-MM-DD` values; timestamp suffixes are not truncated.
+- Insight EAN/offer identities are validated before facts are created. Catalog EANs require their exact current offer ID. Commercial-only EANs require one unique exact shipment offer identity; unknown, reused, conflicting, and return-only identities fail closed.
 - Buy Box percentages retain country and date and are never summed into a fabricated total.
-- Weekly visits require seven aligned dates for every offer. Partial daily evidence does not become a weekly metric.
+- Weekly visits require the exact seven claimed dates for every EAN in the weekly report,
+  including sold or returned products absent from the current offer list. Partial
+  daily evidence does not become a weekly metric.
 - Same-week units divided by visits is labeled as a trading proxy, not cohort conversion.
 - Reporting revisions are provisional until settlement and accounting reconciliation are complete.
 
@@ -34,8 +44,9 @@ W37-W39 promotion migration accepts an older insights artifact only after checks
 byte-count, EAN, and seven-date alignment checks. W36 remains unavailable because its
 legacy insight dates belong to W37.
 
-Run the focused regression suite with:
+Run the Edge type check and focused regression suite with:
 
 ```bash
+deno check --frozen --lock=deno.lock --node-modules-dir=none supabase/functions/bol-retailer-transform/index.ts
 node --test tests/retailer-cloud-extract.test.mjs tests/retailer-transform.test.mjs
 ```

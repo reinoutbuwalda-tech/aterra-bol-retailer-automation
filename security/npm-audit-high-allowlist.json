@@ -1,0 +1,18 @@
+{
+  "entries": [
+    {
+      "advisory": "GHSA-vfj7-8cjw-p6xm",
+      "url": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+      "packages": [
+        "@next/eslint-plugin-next",
+        "braces",
+        "eslint-config-next",
+        "fast-glob",
+        "micromatch"
+      ],
+      "owner": "Aterra repository maintainers",
+      "rationale": "Development-only ESLint glob parsing path; npm offers only a breaking downgrade to eslint-config-next 14.x. Production dependency audit is clean at high severity.",
+      "expires": "2027-01-05"
+    }
+  ]
+}
