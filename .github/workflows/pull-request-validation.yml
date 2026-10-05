@@ -76,6 +76,7 @@ jobs:
         shell: bash
         run: |
           cp tests/fixtures/supabase-product-master-prerequisite.sql supabase/migrations/20260801000000_test_product_master_prerequisite.sql
+          cp tests/fixtures/supabase-historical-foundation-prerequisite.sql supabase/migrations/20260929160000_test_historical_foundation_prerequisite.sql
           cp supabase/migrations/20260930155322_retailer_transform_v2_contract.sql "$RUNNER_TEMP/retailer_transform_v2_contract.sql"
           rm supabase/migrations/20260930155322_retailer_transform_v2_contract.sql
           supabase init --force
