@@ -46,11 +46,14 @@ function psqlAsync(sql) {
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 function assertDisposableSupabase() {
-  const identity = psql("select current_database() || ':' || inet_server_port();");
+  const target = new URL(databaseUrl);
+  assert.equal(target.hostname, '127.0.0.1');
+  assert.equal(target.port, '54322');
+  assert.equal(target.pathname, '/postgres');
   assert.equal(
-    identity,
-    'postgres:54322',
-    'Full-chain tests refuse to modify anything except the disposable local Supabase database on port 54322.',
+    psql('select current_database();'),
+    'postgres',
+    'Full-chain tests refuse to modify anything except the disposable local Supabase database at 127.0.0.1:54322/postgres.',
   );
 }
 
