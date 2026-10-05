@@ -217,6 +217,34 @@ function canonicalInput() {
   };
 }
 
+function canonicalInvoiceInput() {
+  const input = canonicalInput();
+  input.loaded.artifacts.financial.settlement.invoices = [{
+    invoiceId: 'invoice-1',
+    issueDate: '2026-09-27',
+    invoiceType: 'ALL_IN_ONE',
+    invoicePeriod: { startDate: '2026-09-21', endDate: '2026-09-27' },
+    legalMonetaryTotal: {
+      payableAmount: { amount: 12.34, currencyID: 'EUR' },
+      taxExclusiveAmount: { amount: 10.2, currencyID: 'EUR' },
+      taxInclusiveAmount: { amount: 12.34, currencyID: 'EUR' },
+    },
+  }];
+  input.loaded.artifacts.financial.settlement.invoiceSpecifications = [{
+    invoiceId: 'invoice-1',
+    lines: [{
+      invoiceLineRef: 'line-1',
+      type: 'COMMISSION',
+      quantity: -1.25,
+      lineExtensionAmount: { amount: -12.3456, currencyID: 'EUR' },
+      priceAmount: { amount: 9.5, currencyID: 'EUR' },
+      taxAmount: { amount: -2.1456, currencyID: 'EUR' },
+      taxPercentage: 21,
+    }],
+  }];
+  return input;
+}
+
 function manifestInput() {
   const { claim } = canonicalInput();
   claim.manifestPath = `retailer-api/year=2026/week=39/run=${claim.sourceRunId}/manifest.json`;
@@ -500,8 +528,8 @@ test('shipments outside the claimed Monday-Sunday period fail closed', async () 
   );
 });
 
-test('shipment quantity rejects every non-number or non-positive-safe-integer raw value', async () => {
-  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
+test('shipment quantity rejects every non-number or non-positive-int32 raw value', async () => {
+  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, 2_147_483_648, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
   for (const invalidQuantity of invalidQuantities) {
     const context = transformer();
     const { claim, loaded } = canonicalInput();
@@ -516,7 +544,7 @@ test('shipment quantity rejects every non-number or non-positive-safe-integer ra
   }
 });
 
-test('shipment quantity accepts a positive safe integer JSON number without coercion', async () => {
+test('shipment quantity accepts a positive int32 JSON number without coercion', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
   loaded.artifacts.commercial.operational.shipmentDetails[0]
@@ -529,6 +557,36 @@ test('shipment quantity accepts a positive safe integer JSON number without coer
   assert.equal(metric.gross_shipped_units, 2);
 });
 
+test('shipment monetary fields reject coercible or imprecise source values', async () => {
+  const invalidValues = [undefined, null, true, [], {}, '', '1.00', ' 1 ', 1e-7, 0.12345678901234567, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -1];
+  for (const [field, code] of [['unitPrice', 'INVALID_SHIPMENT_UNIT_PRICE'], ['commission', 'INVALID_SHIPMENT_COMMISSION']]) {
+    for (const invalidValue of invalidValues) {
+      const context = transformer();
+      const { claim, loaded } = canonicalInput();
+      loaded.artifacts.commercial.operational.shipmentDetails[0]
+        .detail.shipmentItems[0][field] = invalidValue;
+      let publication;
+      await assert.rejects(
+        async () => { publication = await context.buildPublication(claim, loaded); },
+        error => error.code === code,
+      );
+      assert.equal(publication, undefined);
+    }
+  }
+});
+
+test('shipment monetary fields accept exact zero and positive JSON numbers', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const item = loaded.artifacts.commercial.operational.shipmentDetails[0].detail.shipmentItems[0];
+  item.unitPrice = 0;
+  item.commission = 0;
+  const publication = await context.buildPublication(claim, loaded);
+  const fact = publication.facts.outbound_shipment_items.find(row => row.shipment_id === 'shipment-1');
+  assert.equal(fact.unit_price, 0);
+  assert.equal(fact.commission, 0);
+});
+
 test('returns outside the claimed Monday-Sunday period fail closed', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
@@ -539,8 +597,8 @@ test('returns outside the claimed Monday-Sunday period fail closed', async () =>
   );
 });
 
-test('return quantity rejects every non-number or non-positive-safe-integer raw value', async () => {
-  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
+test('return quantity rejects every non-number or non-positive-int32 raw value', async () => {
+  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, 2_147_483_648, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
   for (const invalidQuantity of invalidQuantities) {
     const context = transformer();
     const { claim, loaded } = canonicalInput();
@@ -555,7 +613,7 @@ test('return quantity rejects every non-number or non-positive-safe-integer raw 
   }
 });
 
-test('return quantity accepts a positive safe integer JSON number without coercion', async () => {
+test('return quantity accepts a positive int32 JSON number without coercion', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
   const linkedReturn = loaded.artifacts.commercial.operational.returns
@@ -567,6 +625,73 @@ test('return quantity accepts a positive safe integer JSON number without coerci
   const metric = publication.weeklyReport.metrics.find(row => row.ean === linkedReturn.ean);
   assert.equal(fact.expected_quantity, 2);
   assert.equal(metric.linked_return_units, 2);
+});
+
+test('shipment and return quantities accept the PostgreSQL int32 maximum', async () => {
+  const shipmentContext = transformer();
+  const shipmentInput = canonicalInput();
+  const shipmentItem = shipmentInput.loaded.artifacts.commercial.operational.shipmentDetails[0].detail.shipmentItems[0];
+  shipmentItem.quantityShipped = 2_147_483_647;
+  shipmentItem.unitPrice = 0;
+  shipmentItem.commission = 0;
+  const shipmentPublication = await shipmentContext.buildPublication(shipmentInput.claim, shipmentInput.loaded);
+  assert.equal(
+    shipmentPublication.weeklyReport.metrics.find(row => row.ean === '6970452112658').gross_shipped_units,
+    2_147_483_647,
+  );
+
+  const returnContext = transformer();
+  const returnInput = canonicalInput();
+  const returnItem = returnInput.loaded.artifacts.commercial.operational.returns[0].returnItems[0];
+  returnItem.expectedQuantity = 2_147_483_647;
+  const returnPublication = await returnContext.buildPublication(returnInput.claim, returnInput.loaded);
+  assert.equal(
+    returnPublication.weeklyReport.metrics.find(row => row.ean === returnItem.ean).unlinked_return_units,
+    2_147_483_647,
+  );
+});
+
+test('per-EAN shipment quantity aggregate overflow fails before publication', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const first = loaded.artifacts.commercial.operational.shipmentDetails[0];
+  first.detail.shipmentItems[0].quantityShipped = 2_147_483_647;
+  first.detail.shipmentItems[0].unitPrice = 0;
+  first.detail.shipmentItems[0].commission = 0;
+  const second = structuredClone(first);
+  second.shipmentId = 'shipment-int32-overflow';
+  second.detail.shipmentId = 'shipment-int32-overflow';
+  second.detail.order.orderId = 'order-int32-overflow';
+  second.detail.shipmentItems[0].orderItemId = 'order-item-int32-overflow';
+  second.detail.shipmentItems[0].quantityShipped = 1;
+  loaded.artifacts.commercial.operational.shipmentDetails.push(second);
+  let publication;
+  await assert.rejects(
+    async () => { publication = await context.buildPublication(claim, loaded); },
+    error => error.code === 'WEEKLY_INTEGER_OUT_OF_RANGE',
+  );
+  assert.equal(publication, undefined);
+});
+
+test('grouped return quantity aggregate overflow fails before publication', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const shipment = loaded.artifacts.commercial.operational.shipmentDetails
+    .find(row => row.detail.order.orderId === 'order-2');
+  shipment.detail.shipmentItems[0].quantityShipped = 2_147_483_647;
+  shipment.detail.shipmentItems[0].unitPrice = 0;
+  shipment.detail.shipmentItems[0].commission = 0;
+  const returnCase = loaded.artifacts.commercial.operational.returns
+    .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
+  const original = returnCase.returnItems[0];
+  original.expectedQuantity = 2_147_483_647;
+  returnCase.returnItems.push({ ...structuredClone(original), rmaId: 'rma-int32-overflow', expectedQuantity: 1 });
+  let publication;
+  await assert.rejects(
+    async () => { publication = await context.buildPublication(claim, loaded); },
+    error => error.code === 'RETURN_QUANTITY_AGGREGATE_OUT_OF_RANGE',
+  );
+  assert.equal(publication, undefined);
 });
 
 test('a return without an order ID cannot receive a financial value match', async () => {
@@ -1054,15 +1179,32 @@ test('duplicate product-visit dates fail instead of inflating the weekly total',
   );
 });
 
-test('visit date coverage requires a valid nonnegative total', async () => {
+test('weekly product-visit aggregate overflow fails before publication', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
   const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
-  visits.periods[0].total = null;
+  visits.periods[0].total = 2_147_483_647;
+  visits.periods[1].total = 1;
+  let publication;
   await assert.rejects(
-    context.buildPublication(claim, loaded),
-    error => error.code === 'INVALID_PRODUCT_VISIT_TOTAL',
+    async () => { publication = await context.buildPublication(claim, loaded); },
+    error => error.code === 'WEEKLY_INTEGER_OUT_OF_RANGE',
   );
+  assert.equal(publication, undefined);
+});
+
+test('product-visit totals require nonnegative int32 JSON numbers', async () => {
+  const invalidTotals = [null, true, 1.5, '1', ' 1 ', -1, 2_147_483_648, NaN, Infinity];
+  for (const invalidTotal of invalidTotals) {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
+    visits.periods[0].total = invalidTotal;
+    await assert.rejects(
+      context.buildPublication(claim, loaded),
+      error => error.code === 'INVALID_PRODUCT_VISIT_TOTAL',
+    );
+  }
 });
 
 test('canonical rank dates are accepted exactly', async () => {
@@ -1122,6 +1264,186 @@ test('malformed catalog offers cannot disappear from weekly coverage', async () 
     context.buildPublication(claim, loaded),
     error => error.code === 'INVALID_CATALOG_OFFER',
   );
+});
+
+test('order-item monetary facts use strict decimals and exact derived totals', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  loaded.artifacts.commercial.operational.ordersFromShipmentDetails = [{
+    status: 200,
+    detail: {
+      orderId: 'demand-order-1',
+      orderPlacedDateTime: '2026-09-21T10:00:00+02:00',
+      orderItems: [{
+        orderItemId: 'demand-item-1',
+        product: { ean: '8720892887504', title: 'Fruit carafe' },
+        offer: { offerId: 'offer-fruit-carafe' },
+        fulfilment: { method: 'FBR', distributionParty: 'RETAILER' },
+        quantity: 2,
+        quantityShipped: 0,
+        quantityCancelled: 0,
+        unitPrice: 10.015,
+      }],
+    },
+  }];
+  const publication = await context.buildPublication(claim, loaded);
+  const fact = publication.facts.order_items[0];
+  assert.equal(fact.unit_price, 10.02);
+  assert.equal(fact.total_price, 20.03);
+  assert.equal(fact.commission, null);
+
+  const invalidContext = transformer();
+  const invalidInput = canonicalInput();
+  invalidInput.loaded.artifacts.commercial.operational.ordersFromShipmentDetails = structuredClone(
+    loaded.artifacts.commercial.operational.ordersFromShipmentDetails,
+  );
+  invalidInput.loaded.artifacts.commercial.operational.ordersFromShipmentDetails[0]
+    .detail.orderItems[0].unitPrice = '10.01';
+  await assert.rejects(
+    invalidContext.buildPublication(invalidInput.claim, invalidInput.loaded),
+    error => error.code === 'INVALID_ORDER_ITEM_UNIT_PRICE',
+  );
+});
+
+test('commission estimates preserve absent optionals and reject malformed financial values', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  loaded.artifacts.catalog.currentState.commissions = [{
+    ean: '8720892887504', status: 200, unitPrice: 0, result: {},
+  }];
+  const publication = await context.buildPublication(claim, loaded);
+  const fact = publication.facts.commission_estimates[0];
+  assert.equal(fact.unit_price, 0);
+  assert.equal(fact.fixed_amount, null);
+  assert.equal(fact.percentage, null);
+  assert.equal(fact.total_cost, null);
+
+  const invalidCases = [
+    ['unitPrice', 'INVALID_COMMISSION_ESTIMATE_UNIT_PRICE', '1.00'],
+    ['fixedAmount', 'INVALID_COMMISSION_FIXED_AMOUNT', true],
+    ['percentage', 'INVALID_COMMISSION_PERCENTAGE', 100.000001],
+    ['totalCost', 'INVALID_COMMISSION_TOTAL_COST', {}],
+  ];
+  for (const [field, code, invalidValue] of invalidCases) {
+    const invalidContext = transformer();
+    const invalidInput = canonicalInput();
+    const row = { ean: '8720892887504', status: 200, unitPrice: 1, result: {} };
+    if (field === 'unitPrice') row.unitPrice = invalidValue;
+    else row.result[field] = invalidValue;
+    invalidInput.loaded.artifacts.catalog.currentState.commissions = [row];
+    await assert.rejects(
+      invalidContext.buildPublication(invalidInput.claim, invalidInput.loaded),
+      error => error.code === code,
+    );
+  }
+});
+
+test('valid invoice decimals preserve exact signs and optional nulls', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInvoiceInput();
+  loaded.artifacts.financial.settlement.invoiceSpecifications[0].lines.push({
+    invoiceLineRef: 'line-optional-null',
+    type: 'ADJUSTMENT',
+    lineExtensionAmount: { amount: 0, currencyID: 'EUR' },
+  });
+  const publication = await context.buildPublication(claim, loaded);
+  const header = publication.facts.invoice_headers[0];
+  const line = publication.facts.invoice_transactions.find(row => row.invoice_line_ref === 'line-1');
+  const optional = publication.facts.invoice_transactions.find(row => row.invoice_line_ref === 'line-optional-null');
+  assert.equal(header.payable_amount, '12.34');
+  assert.equal(header.tax_exclusive_amount, '10.2');
+  assert.equal(line.quantity, '-1.25');
+  assert.equal(line.line_extension_amount, '-12.3456');
+  assert.equal(line.tax_amount, '-2.1456');
+  assert.equal(line.source_sign, '-12.3456');
+  assert.equal(line.settlement_effect, '12.3456');
+  assert.equal(optional.line_extension_amount, '0');
+  assert.equal(optional.quantity, null);
+  assert.equal(optional.price_amount, null);
+  assert.equal(optional.tax_amount, null);
+  assert.equal(optional.tax_percentage, null);
+  assert.equal(publication.dataProductRevisions.find(row => row.data_product === 'invoices').status, 'ready');
+});
+
+test('optional invoice header totals remain null only when absent', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInvoiceInput();
+  delete loaded.artifacts.financial.settlement.invoices[0].legalMonetaryTotal.taxExclusiveAmount;
+  delete loaded.artifacts.financial.settlement.invoices[0].legalMonetaryTotal.taxInclusiveAmount;
+  const publication = await context.buildPublication(claim, loaded);
+  assert.equal(publication.facts.invoice_headers[0].tax_exclusive_amount, null);
+  assert.equal(publication.facts.invoice_headers[0].tax_inclusive_amount, null);
+
+  for (const [field, code] of [['taxExclusiveAmount', 'INVALID_INVOICE_TAX_EXCLUSIVE_AMOUNT'], ['taxInclusiveAmount', 'INVALID_INVOICE_TAX_INCLUSIVE_AMOUNT']]) {
+    const invalidContext = transformer();
+    const invalidInput = canonicalInvoiceInput();
+    invalidInput.loaded.artifacts.financial.settlement.invoices[0].legalMonetaryTotal[field] = ' 10.00 ';
+    await assert.rejects(
+      invalidContext.buildPublication(invalidInput.claim, invalidInput.loaded),
+      error => error.code === code,
+    );
+  }
+});
+
+test('required invoice payable and line amounts reject malformed source values', async () => {
+  const invalidValues = [undefined, null, true, [], {}, '', '1.00', ' 1 ', 1e-7, 0.12345678901234567, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
+  for (const [target, code] of [['payable', 'INVALID_INVOICE_PAYABLE_AMOUNT'], ['line', 'INVALID_INVOICE_LINE_AMOUNT']]) {
+    for (const invalidValue of invalidValues) {
+      const context = transformer();
+      const { claim, loaded } = canonicalInvoiceInput();
+      if (target === 'payable') loaded.artifacts.financial.settlement.invoices[0].legalMonetaryTotal.payableAmount = invalidValue;
+      else loaded.artifacts.financial.settlement.invoiceSpecifications[0].lines[0].lineExtensionAmount = invalidValue;
+      let publication;
+      await assert.rejects(
+        async () => { publication = await context.buildPublication(claim, loaded); },
+        error => error.code === code,
+      );
+      assert.equal(publication, undefined);
+    }
+  }
+});
+
+test('optional invoice decimals remain null only when absent and reject malformed values', async () => {
+  const cases = [
+    ['quantity', 'INVALID_INVOICE_QUANTITY'],
+    ['priceAmount', 'INVALID_INVOICE_PRICE_AMOUNT'],
+    ['taxAmount', 'INVALID_INVOICE_TAX_AMOUNT'],
+    ['taxPercentage', 'INVALID_INVOICE_TAX_PERCENTAGE'],
+  ];
+  const invalidValues = [true, [], {}, '', '1', ' 1 ', 1e-7, 0.12345678901234567, NaN, Infinity];
+  for (const [field, code] of cases) {
+    for (const invalidValue of invalidValues) {
+      const context = transformer();
+      const { claim, loaded } = canonicalInvoiceInput();
+      loaded.artifacts.financial.settlement.invoiceSpecifications[0].lines[0][field] = invalidValue;
+      let publication;
+      await assert.rejects(
+        async () => { publication = await context.buildPublication(claim, loaded); },
+        error => error.code === code,
+      );
+      assert.equal(publication, undefined);
+    }
+  }
+});
+
+test('invoice tax percentage rejects values outside zero through one hundred', async () => {
+  for (const invalidValue of [-1, 100.0001]) {
+    const context = transformer();
+    const { claim, loaded } = canonicalInvoiceInput();
+    loaded.artifacts.financial.settlement.invoiceSpecifications[0].lines[0].taxPercentage = invalidValue;
+    await assert.rejects(
+      context.buildPublication(claim, loaded),
+      error => error.code === 'INVALID_INVOICE_TAX_PERCENTAGE',
+    );
+  }
+});
+
+test('negative invoice payable values remain exact for credit documents', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInvoiceInput();
+  loaded.artifacts.financial.settlement.invoices[0].legalMonetaryTotal.payableAmount = { amount: -12.34, currencyID: 'EUR' };
+  const publication = await context.buildPublication(claim, loaded);
+  assert.equal(publication.facts.invoice_headers[0].payable_amount, '-12.34');
 });
 
 test('malformed invoice headers cannot coexist with a ready financial product', async () => {

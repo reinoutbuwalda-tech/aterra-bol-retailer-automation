@@ -108,6 +108,10 @@ function nullableText(value: unknown): string | null {
   return result ? result : null;
 }
 
+// Tolerant numeric normalization is limited to nonfinancial status, storage,
+// catalog-stock, rank, and country-insight fields. Monetary and published
+// quantity contracts use strictJsonDecimal/positiveInt32 instead.
+
 function numberValue(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const result = Number(value);
@@ -119,8 +123,14 @@ function integer(value: unknown, fallback = 0): number {
   return result === null ? fallback : Math.trunc(result);
 }
 
-function positiveSafeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+const POSTGRES_INT32_MAX = 2_147_483_647;
+
+function positiveInt32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= POSTGRES_INT32_MAX;
+}
+
+function nonnegativeInt32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= POSTGRES_INT32_MAX;
 }
 
 function round(value: number, decimals = 2) {
@@ -128,22 +138,32 @@ function round(value: number, decimals = 2) {
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
-type DecimalFraction = { numerator: bigint; denominator: bigint };
+type DecimalFraction = { numerator: bigint; denominator: bigint; source: string };
 
-function decimalFraction(value: unknown): DecimalFraction | null {
-  if ((typeof value !== "number" && typeof value !== "string") || value === "") return null;
-  const source = String(value).trim();
-  const match = /^([+-]?)(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(source);
-  if (!match) return null;
+function strictJsonDecimal(
+  value: unknown,
+  code: string,
+  label: string,
+  options: { allowNegative?: boolean; maxSignificantDigits?: number } = {},
+): DecimalFraction {
+  const allowNegative = options.allowNegative ?? true;
+  const maxSignificantDigits = options.maxSignificantDigits ?? 16;
+  assertContract(typeof value === "number" && Number.isFinite(value), code, `${label} must be a finite JSON number.`);
+  assertContract(!Number.isInteger(value) || Number.isSafeInteger(value), code, `${label} exceeds safe integer precision.`);
+  const source = String(value);
+  assertContract(!/[eE]/.test(source), code, `${label} must not use exponent notation.`);
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(source);
+  assertContract(match, code, `${label} must use canonical decimal notation.`);
+  const significantDigits = `${match[2]}${match[3] || ""}`.replace(/^0+/, "").length || 1;
+  assertContract(significantDigits <= maxSignificantDigits, code, `${label} exceeds supported decimal precision.`);
   const sign = match[1] === "-" ? -1n : 1n;
+  assertContract(allowNegative || sign > 0n, code, `${label} cannot be negative.`);
   const fractionDigits = match[3] || "";
-  const exponent = Number(match[4] || 0);
-  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 30) return null;
-  const digits = BigInt(`${match[2]}${fractionDigits}`);
-  const scale = fractionDigits.length - exponent;
-  if (Math.abs(scale) > 30) return null;
-  if (scale >= 0) return { numerator: sign * digits, denominator: 10n ** BigInt(scale) };
-  return { numerator: sign * digits * (10n ** BigInt(-scale)), denominator: 1n };
+  return {
+    numerator: sign * BigInt(`${match[2]}${fractionDigits}`),
+    denominator: 10n ** BigInt(fractionDigits.length),
+    source,
+  };
 }
 
 function divideHalfUp(numerator: bigint, denominator: bigint) {
@@ -156,16 +176,12 @@ function divideHalfUp(numerator: bigint, denominator: bigint) {
   return sign * rounded;
 }
 
-function moneyToMinor(value: unknown) {
-  const fraction = decimalFraction(value);
-  if (!fraction) return null;
+function moneyToMinor(fraction: DecimalFraction) {
   return divideHalfUp(fraction.numerator * 100n, fraction.denominator);
 }
 
-function lineGrossToMinor(unitPrice: unknown, quantity: number) {
-  const fraction = decimalFraction(unitPrice);
-  if (!fraction || !Number.isSafeInteger(quantity)) return null;
-  return divideHalfUp(fraction.numerator * BigInt(quantity) * 100n, fraction.denominator);
+function lineGrossToMinor(unitPrice: DecimalFraction, quantity: number) {
+  return divideHalfUp(unitPrice.numerator * BigInt(quantity) * 100n, unitPrice.denominator);
 }
 
 function allocateMinor(totalMinor: bigint, quantity: number, totalQuantity: number) {
@@ -180,10 +196,65 @@ function scaledRatioToNumber(numerator: bigint, denominator: bigint, decimals: n
   return numeric / Number(scale);
 }
 
+
+type ExactDatabaseDecimal = { scaled: bigint; text: string };
+const NUMERIC_14_MAX_SCALED = 99_999_999_999_999n;
+
+function decimalTextFromScaled(value: bigint, scaleDigits = 4) {
+  const sign = value < 0n ? "-" : "";
+  const absolute = value < 0n ? -value : value;
+  const scale = 10n ** BigInt(scaleDigits);
+  const fraction = String(absolute % scale).padStart(scaleDigits, "0").replace(/0+$/, "");
+  return `${sign}${absolute / scale}${fraction ? `.${fraction}` : ""}`;
+}
+
+function amountScalar(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  if ("amount" in value) return value.amount;
+  if ("value" in value) return value.value;
+  return value;
+}
+
+function databaseDecimal(
+  value: unknown,
+  code: string,
+  label: string,
+  options: { required?: boolean; allowNegative?: boolean; scaleDigits?: number; minScaled?: bigint; maxScaled?: bigint } = {},
+): ExactDatabaseDecimal | null {
+  if (value === null || value === undefined) {
+    assertContract(!options.required, code, `${label} is required.`);
+    return null;
+  }
+  const scaleDigits = options.scaleDigits ?? 4;
+  const fraction = strictJsonDecimal(amountScalar(value), code, label, { allowNegative: options.allowNegative });
+  const scaledNumerator = fraction.numerator * (10n ** BigInt(scaleDigits));
+  assertContract(scaledNumerator % fraction.denominator === 0n, code, `${label} supports at most ${scaleDigits} decimal places.`);
+  const scaled = scaledNumerator / fraction.denominator;
+  assertContract(
+    scaled >= -NUMERIC_14_MAX_SCALED && scaled <= NUMERIC_14_MAX_SCALED,
+    code,
+    `${label} exceeds PostgreSQL numeric(14,${scaleDigits}).`,
+  );
+  if (options.minScaled !== undefined) assertContract(scaled >= options.minScaled, code, `${label} is below its allowed range.`);
+  if (options.maxScaled !== undefined) assertContract(scaled <= options.maxScaled, code, `${label} exceeds its allowed range.`);
+  return { scaled, text: decimalTextFromScaled(scaled, scaleDigits) };
+}
+
 function minorToMajor(value: bigint) {
   const numeric = Number(value);
   if (!Number.isSafeInteger(numeric)) throw new PermanentTransformError("MONEY_OUT_OF_RANGE", "Monetary value exceeds the safe publication range.");
   return numeric / 100;
+}
+
+const NUMERIC_14_2_MAX_MINOR = 99_999_999_999_999n;
+
+function assertMinorRange(value: bigint, code: string, label: string, allowNegative = false) {
+  assertContract(allowNegative || value >= 0n, code, `${label} cannot be negative.`);
+  assertContract(
+    value >= -NUMERIC_14_2_MAX_MINOR && value <= NUMERIC_14_2_MAX_MINOR,
+    code,
+    `${label} exceeds PostgreSQL numeric(14,2).`,
+  );
 }
 
 function isoDate(value: unknown): string | null {
@@ -235,12 +306,6 @@ function periodDate(value: JsonRecord): string | null {
   const month = period.month as number;
   const day = period.day as number;
   return isoDate(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
-}
-
-function amount(value: unknown): number | null {
-  if (typeof value === "number") return numberValue(value);
-  const object = record(value);
-  return numberValue(object.amount ?? object.value);
 }
 
 function currency(value: unknown): string | null {
@@ -490,14 +555,28 @@ function additionalProperties(line: JsonRecord) {
 function invoiceLineFields(line: JsonRecord, invoiceId: string, index: number) {
   const item = record(line.Item ?? line.item);
   const descriptions = rows(item.Description ?? item.description);
-  const taxTotal = rows(line.TaxTotal ?? line.taxTotal)[0] || record(line.taxAmount);
-  const taxAmount = record(taxTotal.TaxAmount ?? line.taxAmount);
+  const taxTotal = rows(line.TaxTotal ?? line.taxTotal)[0];
+  const taxTotalRecord = record(taxTotal);
   const taxCategories = rows(item.ClassifiedTaxCategory ?? item.classifiedTaxCategory);
   const properties = additionalProperties(line);
   const transactionType = text(line.type ?? record(item.Name ?? item.name).value ?? item.Name ?? item.name);
   const lineRef = text(line.invoiceLineRef ?? line.InvoiceLineRef ?? `${invoiceId}#${transactionType || "LINE"}`);
   const lineAmountObject = line.lineExtensionAmount ?? line.LineExtensionAmount;
-  const lineAmount = amount(lineAmountObject);
+  const quantitySource = line.quantity ?? ("InvoicedQuantity" in line ? line.InvoicedQuantity : undefined);
+  const priceSource = line.priceAmount ?? record(line.Price).PriceAmount;
+  const taxAmountSource = line.taxAmount ?? taxTotalRecord.TaxAmount ?? taxTotalRecord.taxAmount;
+  const taxPercentageSource = line.taxPercentage ?? record(taxCategories[0]?.Percent).value ?? taxCategories[0]?.Percent;
+  const lineAmount = databaseDecimal(lineAmountObject, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount`, { required: true });
+  assertContract(lineAmount, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount is required.`);
+  const quantity = databaseDecimal(quantitySource, "INVALID_INVOICE_QUANTITY", `Invoice ${invoiceId} line ${index} quantity`);
+  const priceAmount = databaseDecimal(priceSource, "INVALID_INVOICE_PRICE_AMOUNT", `Invoice ${invoiceId} line ${index} priceAmount`);
+  const parsedTaxAmount = databaseDecimal(taxAmountSource, "INVALID_INVOICE_TAX_AMOUNT", `Invoice ${invoiceId} line ${index} taxAmount`);
+  const taxPercentage = databaseDecimal(
+    taxPercentageSource,
+    "INVALID_INVOICE_TAX_PERCENTAGE",
+    `Invoice ${invoiceId} line ${index} taxPercentage`,
+    { allowNegative: false, minScaled: 0n, maxScaled: 1_000_000n },
+  );
   return {
     invoice_id: invoiceId,
     invoice_line_ref: lineRef,
@@ -507,14 +586,14 @@ function invoiceLineFields(line: JsonRecord, invoiceId: string, index: number) {
     track_and_trace: nullableText(properties.trackandtrace ?? properties["track-and-trace"]),
     item_name: transactionType || null,
     item_description: nullableText(line.description ?? descriptions[0]?.value ?? item.Description),
-    quantity: numberValue(line.quantity ?? record(line.InvoicedQuantity).value),
-    line_extension_amount: lineAmount,
-    price_amount: amount(line.priceAmount ?? record(line.Price).PriceAmount),
-    tax_amount: amount(line.taxAmount ?? taxAmount),
-    tax_percentage: numberValue(line.taxPercentage ?? record(taxCategories[0]?.Percent).value),
-    currency: currency(lineAmountObject) || currency(line.priceAmount ?? record(line.Price).PriceAmount),
-    source_sign: lineAmount,
-    settlement_effect: lineAmount === null ? null : -lineAmount,
+    quantity: quantity?.text ?? null,
+    line_extension_amount: lineAmount.text,
+    price_amount: priceAmount?.text ?? null,
+    tax_amount: parsedTaxAmount?.text ?? null,
+    tax_percentage: taxPercentage?.text ?? null,
+    currency: currency(lineAmountObject) || currency(priceSource),
+    source_sign: lineAmount.text,
+    settlement_effect: decimalTextFromScaled(-lineAmount.scaled),
     raw_line: line,
     _line_index: index,
   };
@@ -624,21 +703,31 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const ean = text(product.ean ?? item.ean);
       const rawQuantityShipped = item.quantityShipped;
       assertContract(
-        positiveSafeInteger(rawQuantityShipped),
+        positiveInt32(rawQuantityShipped),
         "INVALID_SHIPMENT_QUANTITY",
-        `Shipment ${shipmentId} item ${itemIndex} quantity must be a positive safe integer JSON number.`,
+        `Shipment ${shipmentId} item ${itemIndex} quantity must be a positive PostgreSQL int32 JSON number.`,
       );
       const quantityShipped = rawQuantityShipped;
-      const unitPrice = numberValue(item.unitPrice);
-      const commission = numberValue(item.commission);
-      const lineGrossMinor = unitPrice === null ? null : lineGrossToMinor(unitPrice, quantityShipped);
-      const unitPriceMinor = unitPrice === null ? null : moneyToMinor(unitPrice);
-      const commissionMinor = commission === null ? null : moneyToMinor(commission);
+      const unitPrice = strictJsonDecimal(
+        item.unitPrice,
+        "INVALID_SHIPMENT_UNIT_PRICE",
+        `Shipment ${shipmentId} item ${itemIndex} unitPrice`,
+        { allowNegative: false },
+      );
+      const commission = strictJsonDecimal(
+        item.commission,
+        "INVALID_SHIPMENT_COMMISSION",
+        `Shipment ${shipmentId} item ${itemIndex} commission`,
+        { allowNegative: false },
+      );
+      const lineGrossMinor = lineGrossToMinor(unitPrice, quantityShipped);
+      const unitPriceMinor = moneyToMinor(unitPrice);
+      const commissionMinor = moneyToMinor(commission);
+      assertMinorRange(lineGrossMinor, "INVALID_SHIPMENT_UNIT_PRICE", `Shipment ${shipmentId} item ${itemIndex} line gross`);
+      assertMinorRange(unitPriceMinor, "INVALID_SHIPMENT_UNIT_PRICE", `Shipment ${shipmentId} item ${itemIndex} unitPrice`);
+      assertMinorRange(commissionMinor, "INVALID_SHIPMENT_COMMISSION", `Shipment ${shipmentId} item ${itemIndex} commission`);
       assertContract(
-        orderItemId && /^\d{13}$/.test(ean) && quantityShipped > 0
-          && lineGrossMinor !== null && lineGrossMinor >= 0n
-          && unitPriceMinor !== null && unitPriceMinor >= 0n
-          && commissionMinor !== null && commissionMinor >= 0n,
+        orderItemId && /^\d{13}$/.test(ean),
         "INVALID_SHIPMENT_ITEM",
         `Shipment ${shipmentId} contains an invalid business line.`,
       );
@@ -714,18 +803,37 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const orderItemId = text(item.orderItemId);
       const ean = text(product.ean ?? item.ean);
       if (!orderItemId || !/^\d{13}$/.test(ean)) continue;
+      const quantity = item.quantity;
+      const quantityShipped = item.quantityShipped;
+      const quantityCancelled = item.quantityCancelled;
+      assertContract(
+        nonnegativeInt32(quantity) && nonnegativeInt32(quantityShipped) && nonnegativeInt32(quantityCancelled),
+        "INVALID_ORDER_ITEM_QUANTITY",
+        `Order item ${orderItemId} quantities must be nonnegative int32 JSON numbers.`,
+      );
+      const unitPrice = strictJsonDecimal(item.unitPrice, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`, { allowNegative: false });
+      const unitPriceMinor = moneyToMinor(unitPrice);
+      const totalPriceMinor = item.totalPrice === null || item.totalPrice === undefined
+        ? lineGrossToMinor(unitPrice, quantity)
+        : moneyToMinor(strictJsonDecimal(item.totalPrice, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`, { allowNegative: false }));
+      const commissionMinor = item.commission === null || item.commission === undefined
+        ? null
+        : moneyToMinor(strictJsonDecimal(item.commission, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`, { allowNegative: false }));
+      assertMinorRange(unitPriceMinor, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`);
+      assertMinorRange(totalPriceMinor, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`);
+      if (commissionMinor !== null) assertMinorRange(commissionMinor, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`);
       const orderItemFields = {
         order_item_id: orderItemId,
         order_id: orderId,
         ean,
         offer_id: nullableText(offer.offerId),
         product_title: nullableText(product.title),
-        quantity: integer(item.quantity),
-        quantity_shipped: integer(item.quantityShipped),
-        quantity_cancelled: integer(item.quantityCancelled),
-        unit_price: round(numberValue(item.unitPrice) || 0, 2),
-        total_price: round(numberValue(item.totalPrice) ?? ((numberValue(item.unitPrice) || 0) * integer(item.quantity)), 2),
-        commission: numberValue(item.commission) === null ? null : round(numberValue(item.commission)!, 2),
+        quantity,
+        quantity_shipped: quantityShipped,
+        quantity_cancelled: quantityCancelled,
+        unit_price: minorToMajor(unitPriceMinor),
+        total_price: minorToMajor(totalPriceMinor),
+        commission: commissionMinor === null ? null : minorToMajor(commissionMinor),
         fulfilment_method: nullableText(fulfilment.method),
         distribution_party: nullableText(fulfilment.distributionParty),
         latest_delivery_date: isoDate(fulfilment.latestDeliveryDate),
@@ -762,9 +870,9 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const orderId = nullableText(item.orderId);
       const rawExpectedQuantity = item.expectedQuantity;
       assertContract(
-        positiveSafeInteger(rawExpectedQuantity),
+        positiveInt32(rawExpectedQuantity),
         "INVALID_RETURN_QUANTITY",
-        `Return ${returnId} item ${itemIndex} expectedQuantity must be a positive safe integer JSON number.`,
+        `Return ${returnId} item ${itemIndex} expectedQuantity must be a positive PostgreSQL int32 JSON number.`,
       );
       const expectedQuantity = rawExpectedQuantity;
       assertContract(rmaId && /^\d{13}$/.test(ean), "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
@@ -840,9 +948,9 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
     const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
     assertContract(
-      positiveSafeInteger(aggregateReturnQuantity),
-      "INVALID_RETURN_QUANTITY",
-      `Shipment item ${allocationKey} aggregate return quantity exceeds the safe integer range.`,
+      positiveInt32(aggregateReturnQuantity),
+      "RETURN_QUANTITY_AGGREGATE_OUT_OF_RANGE",
+      `Shipment item ${allocationKey} aggregate return quantity exceeds PostgreSQL int32.`,
     );
     const lineGrossMinor = candidate._line_gross_minor as bigint;
     const commissionMinor = candidate._commission_minor as bigint;
@@ -918,7 +1026,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const product = record(offer.product);
     const pricing = record(offer.pricing);
     const bundlePrices = rows(pricing.bundlePrices);
-    const unitPrice = numberValue(bundlePrices.find(price => integer(price.quantity) === 1)?.unitPrice ?? bundlePrices[0]?.unitPrice);
+    const priceEntry = bundlePrices.find(price => price.quantity === 1) ?? bundlePrices[0];
+    const catalogUnitPrice = priceEntry?.unitPrice === null || priceEntry?.unitPrice === undefined
+      ? null
+      : strictJsonDecimal(priceEntry.unitPrice, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`, { allowNegative: false });
+    const catalogUnitPriceMinor = catalogUnitPrice ? moneyToMinor(catalogUnitPrice) : null;
+    if (catalogUnitPriceMinor !== null) assertMinorRange(catalogUnitPriceMinor, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`);
     const fulfilment = record(offer.fulfilment);
     if (text(fulfilment.method) === "FBB") fbbOffers += 1;
     const observedAt = generatedAt;
@@ -934,7 +1047,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       stock_managed_by_retailer: stock.managedByRetailer === null || stock.managedByRetailer === undefined ? null : Boolean(stock.managedByRetailer),
       condition_category: nullableText(record(offer.condition).category),
       bol_product_id: nullableText(product.bolProductId),
-      unit_price: unitPrice === null ? null : round(unitPrice, 2),
+      unit_price: catalogUnitPriceMinor === null ? null : minorToMajor(catalogUnitPriceMinor),
       fulfilment_method: nullableText(fulfilment.method),
       fulfilment_schedule: nullableText(fulfilment.schedule),
     };
@@ -964,14 +1077,21 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const ean = text(commission.ean);
     const result = record(commission.result);
     if (!/^\d{13}$/.test(ean) || integer(commission.status) !== 200) continue;
+    const estimateUnitPrice = strictJsonDecimal(commission.unitPrice, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`, { allowNegative: false });
+    const estimateUnitPriceMinor = moneyToMinor(estimateUnitPrice);
+    assertMinorRange(estimateUnitPriceMinor, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`);
+    const fixedAmount = databaseDecimal(result.fixedAmount, "INVALID_COMMISSION_FIXED_AMOUNT", `Commission estimate ${ean} fixedAmount`, { allowNegative: false });
+    const percentage = databaseDecimal(result.percentage, "INVALID_COMMISSION_PERCENTAGE", `Commission estimate ${ean} percentage`, { allowNegative: false, scaleDigits: 6, minScaled: 0n, maxScaled: 100_000_000n });
+    const totalCost = databaseDecimal(result.totalCost, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCost`, { allowNegative: false });
+    const totalCostWithoutReduction = databaseDecimal(result.totalCostWithoutReduction, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCostWithoutReduction`, { allowNegative: false });
     const fields = {
       ean,
       observed_at: generatedAt,
-      unit_price: round(numberValue(commission.unitPrice) || 0, 2),
-      fixed_amount: numberValue(result.fixedAmount),
-      percentage: numberValue(result.percentage),
-      total_cost: numberValue(result.totalCost),
-      total_cost_without_reduction: numberValue(result.totalCostWithoutReduction),
+      unit_price: minorToMajor(estimateUnitPriceMinor),
+      fixed_amount: fixedAmount?.text ?? null,
+      percentage: percentage?.text ?? null,
+      total_cost: totalCost?.text ?? null,
+      total_cost_without_reduction: totalCostWithoutReduction?.text ?? null,
       raw_result: result,
     };
     facts.commission_estimates.push(await fact(fields, `${ean}|${generatedAt}|${fields.unit_price}`, "catalog", `/currentState/commissions/${commissionIndex}`, generatedAt, now));
@@ -1054,9 +1174,10 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         assertContract(!seenBuyBoxDates.has(buyBoxDateKey), "DUPLICATE_BUY_BOX_DATE", `Buy Box data for EAN ${ean} contains date ${date} more than once.`);
         seenBuyBoxDates.add(buyBoxDateKey);
       }
-      const total = numberValue(period.total ?? period.value ?? period.count);
+      const totalValue = period.total ?? period.value ?? period.count;
       if (metricName === "PRODUCT_VISITS") {
-        assertContract(total !== null && Number.isInteger(total) && total >= 0, "INVALID_PRODUCT_VISIT_TOTAL", `Product visits for EAN ${ean} on ${date} must be a nonnegative integer.`);
+        assertContract(nonnegativeInt32(totalValue), "INVALID_PRODUCT_VISIT_TOTAL", `Product visits for EAN ${ean} on ${date} must be a nonnegative int32 JSON number.`);
+        const total = totalValue;
         const visitKey = `${ean}|${date}`;
         assertContract(!seenVisitTotals.has(visitKey), "DUPLICATE_PRODUCT_VISIT_DATE", `Product visits for EAN ${ean} contain date ${date} more than once.`);
         seenVisitTotals.add(visitKey);
@@ -1065,7 +1186,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         visitDatesByEan.set(ean, dateSet);
         const fields = { offer_id: offerId, ean, metric_date: date, metric: metricName, country_code: null, is_total: true, value: total };
         facts.offer_insight_daily.push(await fact(fields, `${offerId}|${date}|${metricName}|TOTAL`, "insights", `/weekMetrics/offerInsights/${insightIndex}/periods/${periodIndex}`, date, now));
-        metricFor(ean).visits = (metricFor(ean).visits || 0) + integer(total);
+        metricFor(ean).visits = (metricFor(ean).visits || 0) + total;
       }
       const countriesValue = period.countries ?? [];
       assertContract(
@@ -1138,19 +1259,35 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     seenInvoiceIds.add(invoiceId);
     const period = record(invoice.invoicePeriod);
     const totals = record(invoice.legalMonetaryTotal);
-    const payable = totals.payableAmount;
-    const taxExclusive = totals.taxExclusiveAmount;
-    const taxInclusive = totals.taxInclusiveAmount;
+    const payable = databaseDecimal(
+      totals.payableAmount,
+      "INVALID_INVOICE_PAYABLE_AMOUNT",
+      `Invoice ${invoiceId} payableAmount`,
+      { required: true, scaleDigits: 2 },
+    );
+    assertContract(payable, "INVALID_INVOICE_PAYABLE_AMOUNT", `Invoice ${invoiceId} payableAmount is required.`);
+    const taxExclusive = databaseDecimal(
+      totals.taxExclusiveAmount,
+      "INVALID_INVOICE_TAX_EXCLUSIVE_AMOUNT",
+      `Invoice ${invoiceId} taxExclusiveAmount`,
+      { scaleDigits: 2 },
+    );
+    const taxInclusive = databaseDecimal(
+      totals.taxInclusiveAmount,
+      "INVALID_INVOICE_TAX_INCLUSIVE_AMOUNT",
+      `Invoice ${invoiceId} taxInclusiveAmount`,
+      { scaleDigits: 2 },
+    );
     const fields = {
       invoice_id: invoiceId,
       issue_date: isoDate(invoice.issueDate),
       invoice_type: nullableText(invoice.invoiceType),
       period_start: isoDate(period.startDate),
       period_end: isoDate(period.endDate),
-      payable_amount: amount(payable),
-      tax_exclusive_amount: amount(taxExclusive),
-      tax_inclusive_amount: amount(taxInclusive),
-      currency: currency(payable) || currency(taxExclusive),
+      payable_amount: payable.text,
+      tax_exclusive_amount: taxExclusive?.text ?? null,
+      tax_inclusive_amount: taxInclusive?.text ?? null,
+      currency: currency(totals.payableAmount) || currency(totals.taxExclusiveAmount),
       raw_header: invoice,
     };
     facts.invoice_headers.push(await fact(fields, invoiceId, "financial", `/settlement/invoices/${invoiceIndex}`, fields.issue_date || generatedAt, now));
@@ -1220,6 +1357,18 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }));
 
   const weeklyMetrics = [...productMetrics.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ean, metric]) => {
+    assertContract(
+      [metric.grossUnits, metric.registeredReturns, metric.linkedReturns, metric.unlinkedReturns]
+        .every(nonnegativeInt32)
+        && (metric.visits === null || nonnegativeInt32(metric.visits)),
+      "WEEKLY_INTEGER_OUT_OF_RANGE",
+      `Weekly integer aggregate for EAN ${ean} exceeds PostgreSQL int32 or is invalid.`,
+    );
+    assertContract(
+      metric.linkedReturns + metric.unlinkedReturns === metric.registeredReturns,
+      "RETURN_QUANTITY_IDENTITY_MISMATCH",
+      `Return quantity identity does not reconcile for EAN ${ean}.`,
+    );
     const grossGmsMinor = metric.grossGmsMinor;
     const grossCommissionMinor = metric.grossCommissionMinor;
     const linkedReturnGmsMinor = metric.linkedReturnGmsMinor;
@@ -1227,6 +1376,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const provisionalNetGmsMinor = grossGmsMinor - linkedReturnGmsMinor;
     const provisionalAfterCommissionMinor = provisionalNetGmsMinor
       - (grossCommissionMinor - linkedReturnCommissionMinor);
+    assertMinorRange(grossGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly gross GMS for EAN ${ean}`);
+    assertMinorRange(grossCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly gross commission for EAN ${ean}`);
+    assertMinorRange(linkedReturnGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly linked return GMS for EAN ${ean}`);
+    assertMinorRange(linkedReturnCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly linked return commission for EAN ${ean}`);
+    assertMinorRange(provisionalNetGmsMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly provisional net GMS for EAN ${ean}`, true);
+    assertMinorRange(provisionalAfterCommissionMinor, "WEEKLY_MONEY_OUT_OF_RANGE", `Weekly provisional revenue after commission for EAN ${ean}`, true);
     const grossGms = minorToMajor(grossGmsMinor);
     const grossCommission = minorToMajor(grossCommissionMinor);
     const linkedReturnGms = minorToMajor(linkedReturnGmsMinor);

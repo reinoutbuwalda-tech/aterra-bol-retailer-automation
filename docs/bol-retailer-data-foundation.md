@@ -86,10 +86,10 @@ table access; the service role performs controlled pipeline writes.
 
 | Metric | Plain-English rule |
 | --- | --- |
-| Gross shipped units | Positive safe integer `quantityShipped` JSON numbers in outbound shipment lines dated in the week; coercible strings and fractional values are rejected. |
+| Gross shipped units | Positive PostgreSQL int32 `quantityShipped` JSON numbers in outbound shipment lines dated in the week; coercible strings, fractions, values above 2,147,483,647, and overflowing weekly sums are rejected. |
 | Gross shipped GMS | Shipped quantity multiplied by shipment-line unit price. |
 | Gross commission | Sum of the commission amount already reported for each shipment line. |
-| Registered returns | Return events registered in the week whose `expectedQuantity` is a positive safe integer JSON number; strings and fractional values are rejected. |
+| Registered returns | Return events registered in the week whose `expectedQuantity` is a positive PostgreSQL int32 JSON number; strings, fractions, values above 2,147,483,647, and overflowing aggregates are rejected. |
 | Linked returns | All RMAs matched by exact order ID and EAN to one unique weekly shipment item, but only when aggregate group quantity does not exceed shipped quantity. Conflicting groups remain wholly unallocated. |
 | Linked return GMS | Exact shipment-line gross allocated by the accepted group quantity ratio, so a full return reverses the original gross exactly and overflow remains an explicit exception. |
 | Provisional net GMS | Gross shipped GMS minus linked return GMS. |
@@ -104,8 +104,11 @@ parsing, then aggregated without binary floating-point arithmetic. Grouped parti
 returns use deterministic half-up minor-unit allocation. Published monetary fields come
 directly from those integer identities, and the calculation trace preserves every minor-
 unit input. Provisional revenue after commission may be negative when exact commission
-exceeds provisional net GMS; it is retained rather than clamped. Settlement remains
-provisional until invoice and accounting reconciliation is approved.
+exceeds provisional net GMS; it is retained rather than clamped. Required invoice
+monetary values use exact field-specific decimal contracts. Malformed required or
+present optional values reject the transform, while absent optional values remain null;
+a complete financial source cannot stay `ready` after malformed values. Settlement
+remains provisional until invoice and accounting reconciliation is approved.
 
 ## Readiness states
 
@@ -126,7 +129,8 @@ validated offer ID, and an offer ID associated by catalog or shipment evidence w
 another EAN is rejected. An EAN absent from the current catalog may retain insight
 evidence only when shipment facts establish one unique exact offer identity. Unknown or
 conflicting shipment offer IDs are rejected, and return-only evidence cannot verify an
-offer identity. An insight-only foreign EAN is rejected. Visit coverage is checked against every EAN that appears in
+offer identity. An insight-only foreign EAN is rejected. Visit coverage is checked
+against every EAN that appears in
 the weekly report, including a product that shipped or returned during the week but is
 no longer in the current-offer list. One missing product therefore cannot hide behind
 otherwise complete current offers.
