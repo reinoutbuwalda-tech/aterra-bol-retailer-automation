@@ -111,8 +111,10 @@ the JSON backup rather than appearing as extra review tabs.
 message can never be interpreted by the wrong transform semantics:
 
 1. Confirm there are no `queued`, `processing`, or `retry_wait` transform runs and the
-   pgmq queue has no visible or in-flight messages. The migration checks both conditions
-   again and stops without changing anything if either is false.
+   pgmq queue has no visible or in-flight messages. At migration start, the source-run
+   and transform-run tables are locked in a mode that conflicts with completion updates,
+   claims, and inserts; the migration then rechecks both conditions while retaining those
+   locks through commit.
 2. Deploy the v2 Edge worker. Do not invoke an extraction during this short interval.
 3. Apply `20260930155322_retailer_transform_v2_contract.sql`. The migration refuses to
    switch versions while a transform run is nonterminal.
@@ -143,8 +145,8 @@ stranded run IDs, message IDs, attempt state, and error details. In one reviewed
 transaction, archive only the identified v2 queue messages and mark their nonterminal
 transform runs `rejected` with a `ROLLBACK_DISPOSITION` error code and corresponding
 attempt evidence before restoring v1. Do not delete published revisions or bulk-clear
-the queue. If the message-to-run mapping cannot be proven, stop the rollback and restore the v2 worker instead. Already published
-v2 revisions remain immutable audit evidence.
+the queue. If the message-to-run mapping cannot be proven, stop the rollback and restore
+the v2 worker instead. Already published v2 revisions remain immutable audit evidence.
 
 Both weekly reports and individual data products keep the strongest usable revision for
 the week. A later `ready_with_limits` data product cannot displace an existing `ready`
@@ -177,12 +179,18 @@ traffic totals or trend analysis.
 
 ## Verification
 
-The behavioral v2 migration harness runs with `npm run test:migration`. Local execution
-requires a disposable PostgreSQL 16 database named `retailer_migration_ci`, the `psql`
-client, and `RETAILER_MIGRATION_DATABASE_URL`; it refuses every other database name and
-creates and drops only its dedicated test schemas and tables. Without that variable the three database cases report an explicit
-skip. Pull-request CI provisions PostgreSQL 16 and must pass cutover, revision-
-promotion, guard rollback, and forced-backfill rollback cases before release.
+The mandatory fast migration harness runs with `npm run test:migration`. It requires a
+disposable PostgreSQL 16 database named `retailer_migration_ci`, the `psql` client, and
+`RETAILER_MIGRATION_DATABASE_URL`; it refuses every other database name. Missing
+prerequisites fail `npm test` rather than skip. `npm run verify:unit` is the explicitly
+database-free local command. The fast harness uses a minimal pgmq substitute and proves
+migration branching, two-session locking, revision promotion, and transaction rollback;
+it does not claim to prove the full Supabase extension chain.
+
+CI separately removes v2 from the migration directory, applies every preceding migration
+with Supabase CLI `2.119.0`, verifies the real pgmq extension and v1 state, then applies
+the actual v2 migration while a second session attempts source completion. That full-
+chain job is the release evidence for extension compatibility and the cutover race.
 
 `node --test tests/retailer-cloud-extract.test.mjs` runs the collector regression cases.
 The 19 September cloud validation made 221 API calls with zero final API errors,

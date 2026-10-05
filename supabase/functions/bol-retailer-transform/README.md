@@ -26,7 +26,7 @@ The function uses a custom `x-aterra-cron-token` check, so Supabase gateway JWT 
 - An incomplete catalog blocks catalog-dependent products rather than shrinking the
   product universe and accidentally passing coverage.
 - Sales come from outbound shipment items.
-- Returns remain registered events and reduce provisional value only after an exact order-ID and EAN match; cumulative allocations cannot exceed the uniquely matched shipment item.
+- Returns remain registered events. All RMAs that map to one unique shipment item are evaluated as one deterministic group. When aggregate return quantity exceeds shipped quantity, the whole group remains financially unallocated with an explicit exception; otherwise valuation uses the exact shipment-line gross and commission totals, proportionally for partial returns.
 - Gross ASP is calculated before returns.
 - Malformed insight rows and any insight date outside the claimed week fail closed.
 - Buy Box percentages retain country and date and are never summed into a fabricated total.
@@ -41,8 +41,9 @@ W37-W39 promotion migration accepts an older insights artifact only after checks
 byte-count, EAN, and seven-date alignment checks. W36 remains unavailable because its
 legacy insight dates belong to W37.
 
-Run the focused regression suite with:
+Run the Edge type check and focused regression suite with:
 
 ```bash
+deno check --no-lock --node-modules-dir=auto supabase/functions/bol-retailer-transform/index.ts
 node --test tests/retailer-cloud-extract.test.mjs tests/retailer-transform.test.mjs
 ```

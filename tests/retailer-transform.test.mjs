@@ -528,7 +528,7 @@ test('a return quantity larger than its exact shipment match remains unlinked', 
   const metric = publication.weeklyReport.metrics.find(row => row.ean === linkedReturn.ean);
   assert.equal(metric.linked_return_units, 0);
   assert.equal(metric.unlinked_return_units, 99);
-  assert.equal(publication.exceptions.some(row => row.exception_code === 'RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT'), true);
+  assert.equal(publication.exceptions.some(row => row.exception_code === 'RETURN_GROUP_QUANTITY_EXCEEDS_SHIPMENT'), true);
 });
 
 test('distinct returns can cumulatively allocate exactly the shipped quantity', async () => {
@@ -552,28 +552,91 @@ test('distinct returns can cumulatively allocate exactly the shipped quantity', 
   assert.equal(metric.linked_return_gms, metric.gross_shipped_gms);
 });
 
-test('cumulative return overflow remains wholly unallocated with explicit evidence', async () => {
+test('a full return reverses the exact recurring-decimal shipment total and commission', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
-  const returnCase = loaded.artifacts.commercial.operational.returns
-    .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
-  returnCase.returnItems.push({
-    rmaId: 'rma-overflow-carafe-second',
-    orderId: 'order-2',
-    ean: '8720892887504',
-    expectedQuantity: 4,
-    handled: false,
-    returnReason: { mainReason: 'Quality' },
-  });
+  const linkedReturn = loaded.artifacts.commercial.operational.returns
+    .flatMap(row => row.returnItems)
+    .find(item => item.ean === '8720892887504');
+  linkedReturn.orderId = 'order-3';
+  linkedReturn.ean = '8720892887511';
+  linkedReturn.expectedQuantity = 7;
 
   const publication = await context.buildPublication(claim, loaded);
-  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
-  const overflow = publication.exceptions.find(row => row.business_key === 'rma-overflow-carafe-second');
-  assert.equal(metric.linked_return_units, 1);
-  assert.equal(metric.unlinked_return_units, 4);
-  assert.equal(overflow.exception_code, 'RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT');
-  assert.equal(overflow.evidence.alreadyAllocatedReturnQuantity, 1);
-  assert.equal(overflow.evidence.remainingShipmentQuantity, 3);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887511');
+  assert.equal(metric.gross_shipped_gms, 206.93);
+  assert.equal(metric.linked_return_gms, 206.93);
+  assert.equal(metric.provisional_net_gms, 0);
+  assert.equal(metric.gross_commission, 39.1);
+  assert.equal(metric.linked_return_commission, 39.1);
+  assert.equal(metric.provisional_revenue_after_commission, 0);
+});
+
+test('a partial return uses the exact shipment-line valuation ratio', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const linkedReturn = loaded.artifacts.commercial.operational.returns
+    .flatMap(row => row.returnItems)
+    .find(item => item.ean === '8720892887504');
+  linkedReturn.orderId = 'order-3';
+  linkedReturn.ean = '8720892887511';
+  linkedReturn.expectedQuantity = 3;
+
+  const publication = await context.buildPublication(claim, loaded);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887511');
+  assert.equal(metric.linked_return_units, 3);
+  assert.equal(metric.linked_return_gms, 88.68);
+  assert.equal(metric.linked_return_commission, 16.76);
+  assert.equal(metric.provisional_net_gms, 118.25);
+  assert.equal(metric.provisional_revenue_after_commission, 95.91);
+});
+
+test('cumulative return overflow is permutation-invariant and wholly unallocated', async () => {
+  const runPermutation = async reverse => {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    const returnCase = loaded.artifacts.commercial.operational.returns
+      .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
+    const original = structuredClone(returnCase.returnItems[0]);
+    const returns = [
+      { ...original, rmaId: 'rma-overflow-a', expectedQuantity: 1 },
+      { ...original, rmaId: 'rma-overflow-b', expectedQuantity: 4 },
+    ];
+    returnCase.returnItems = reverse ? returns.reverse() : returns;
+    const publication = await context.buildPublication(claim, loaded);
+    const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
+    const overflow = publication.exceptions.find(row => row.exception_code === 'RETURN_GROUP_QUANTITY_EXCEEDS_SHIPMENT');
+    return { metric, overflow };
+  };
+
+  const forward = await runPermutation(false);
+  const reversed = await runPermutation(true);
+  for (const result of [forward, reversed]) {
+    assert.equal(result.metric.linked_return_units, 0);
+    assert.equal(result.metric.unlinked_return_units, 5);
+    assert.equal(result.metric.linked_return_gms, 0);
+    assert.equal(result.metric.linked_return_commission, 0);
+    assert.equal(result.overflow.evidence.aggregateReturnQuantity, 5);
+    assert.equal(result.overflow.evidence.shipmentQuantity, 4);
+    assert.deepEqual(
+      Array.from(result.overflow.evidence.returnItems, item => item.rmaId),
+      ['rma-overflow-a', 'rma-overflow-b'],
+    );
+  }
+  assert.deepEqual(
+    {
+      linked: forward.metric.linked_return_units,
+      unlinked: forward.metric.unlinked_return_units,
+      gms: forward.metric.linked_return_gms,
+      commission: forward.metric.linked_return_commission,
+    },
+    {
+      linked: reversed.metric.linked_return_units,
+      unlinked: reversed.metric.unlinked_return_units,
+      gms: reversed.metric.linked_return_gms,
+      commission: reversed.metric.linked_return_commission,
+    },
+  );
 });
 
 test('duplicate shipment details fail before weekly metrics can double count', async () => {

@@ -90,8 +90,8 @@ table access; the service role performs controlled pipeline writes.
 | Gross shipped GMS | Shipped quantity multiplied by shipment-line unit price. |
 | Gross commission | Sum of the commission amount already reported for each shipment line. |
 | Registered returns | Return events registered in the week. |
-| Linked returns | Return quantity matched by exact order ID and EAN to a unique weekly shipment item, without cumulatively exceeding its shipped quantity. |
-| Linked return GMS | Value removed only for fully allocated linked return quantity; overflow remains an explicit exception. |
+| Linked returns | All RMAs matched by exact order ID and EAN to one unique weekly shipment item, but only when aggregate group quantity does not exceed shipped quantity. Conflicting groups remain wholly unallocated. |
+| Linked return GMS | Exact shipment-line gross allocated by the accepted group quantity ratio, so a full return reverses the original gross exactly and overflow remains an explicit exception. |
 | Provisional net GMS | Gross shipped GMS minus linked return GMS. |
 | Provisional revenue after commission | Provisional net GMS minus net commission after linked returns. |
 | Gross shipped ASP | Gross shipped GMS divided by gross shipped units, before returns. |

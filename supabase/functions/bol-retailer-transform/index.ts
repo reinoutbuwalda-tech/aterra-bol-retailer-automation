@@ -1,4 +1,4 @@
-import { createClient } from "npm:@supabase/supabase-js@2.111.0";
+import { createClient, type SupabaseClient as SupabaseJsClient } from "npm:@supabase/supabase-js@2.111.0";
 
 const TRANSFORM_VERSION = "retailer-transform-v2";
 const SOURCE_CONTRACT_VERSION = "3.0";
@@ -12,7 +12,7 @@ const MAX_MESSAGES_PER_INVOCATION = 2;
 const MAX_TRANSFORM_ATTEMPTS = 5;
 
 type JsonRecord = Record<string, unknown>;
-type SupabaseClient = ReturnType<typeof createClient>;
+type SupabaseClient = SupabaseJsClient<any, "public", any>;
 type Claim = {
   status: string;
   messageId: number;
@@ -192,7 +192,7 @@ function stableStringify(value: unknown) {
 
 async function sha256Hex(value: string | Uint8Array) {
   const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -479,7 +479,10 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const exceptions: JsonRecord[] = [];
 
   const shipmentCandidates = new Map<string, JsonRecord[]>();
-  const allocatedReturnUnitsByShipmentItem = new Map<string, number>();
+  const matchedReturnGroups = new Map<string, {
+    candidate: JsonRecord;
+    returns: Array<{ rmaId: string; expectedQuantity: number }>;
+  }>();
   const productMetrics = new Map<string, {
     grossUnits: number;
     grossGms: number;
@@ -571,7 +574,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       };
       const sourcePointer = `/operational/shipmentDetails/${shipmentIndex}/detail/shipmentItems/${itemIndex}`;
       facts.outbound_shipment_items.push(await fact(itemFields, `${shipmentId}|${orderItemId}`, "commercial", sourcePointer, shipmentAt, now));
-      const candidate = { ...itemFields, sourcePointer };
+      const candidate = {
+        ...itemFields,
+        sourcePointer,
+        _exact_line_gms: quantityShipped * unitPrice,
+        _exact_commission: commission,
+      };
       const matchKey = `${orderId || ""}|${ean}`;
       shipmentCandidates.set(matchKey, [...(shipmentCandidates.get(matchKey) || []), candidate]);
       const metric = metricFor(ean);
@@ -674,38 +682,26 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const candidates = orderId ? shipmentCandidates.get(`${orderId}|${ean}`) || [] : [];
       const candidate = candidates.length === 1 ? candidates[0] : null;
       const allocationKey = candidate ? `${text(candidate.shipment_id)}|${text(candidate.order_item_id)}` : null;
-      const shipmentQuantity = candidate ? integer(candidate.quantity_shipped) : 0;
-      const alreadyAllocatedQuantity = allocationKey ? allocatedReturnUnitsByShipmentItem.get(allocationKey) || 0 : 0;
-      const remainingShipmentQuantity = Math.max(0, shipmentQuantity - alreadyAllocatedQuantity);
-      if (orderId && candidate && allocationKey && expectedQuantity <= remainingShipmentQuantity) {
-        const perUnitCommission = (numberValue(candidate.commission) || 0) / Math.max(1, shipmentQuantity);
-        allocatedReturnUnitsByShipmentItem.set(allocationKey, alreadyAllocatedQuantity + expectedQuantity);
-        metric.linkedReturns += expectedQuantity;
-        metric.linkedReturnGms += expectedQuantity * (numberValue(candidate.unit_price) || 0);
-        metric.linkedReturnCommission += expectedQuantity * perUnitCommission;
+      if (orderId && candidate && allocationKey) {
+        const group = matchedReturnGroups.get(allocationKey) || { candidate, returns: [] };
+        group.returns.push({ rmaId, expectedQuantity });
+        matchedReturnGroups.set(allocationKey, group);
       } else {
         metric.unlinkedReturns += expectedQuantity;
         const missingOrderId = !orderId;
-        const quantityExceedsShipment = Boolean(candidate) && expectedQuantity > remainingShipmentQuantity;
         const ambiguous = candidates.length > 1;
         const exceptionCode = missingOrderId
           ? "RETURN_MISSING_ORDER_ID"
-          : quantityExceedsShipment
-          ? "RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT"
           : ambiguous
           ? "AMBIGUOUS_RETURN_MATCH"
           : "UNMATCHED_RETURN";
         const exceptionTitle = missingOrderId
           ? "Return has no order ID"
-          : quantityExceedsShipment
-          ? "Return quantity exceeds the remaining matched shipment quantity"
           : ambiguous
           ? "Return has several possible shipment matches"
           : "Return has no shipment match in this week";
         const limitation = missingOrderId
           ? "Return could not be linked because its order ID is missing."
-          : quantityExceedsShipment
-          ? "Return was not financially allocated because its full quantity exceeds the remaining matched shipment quantity."
           : ambiguous
           ? "Return could not be linked because several shipment lines matched."
           : "Return could not be linked to a shipment in this reporting week.";
@@ -721,18 +717,54 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
           {
             businessKey: rmaId,
             ean,
-            evidence: {
-              orderId,
-              expectedQuantity,
-              candidateCount: candidates.length,
-              matchedShipmentQuantity: candidate ? shipmentQuantity : null,
-              alreadyAllocatedReturnQuantity: candidate ? alreadyAllocatedQuantity : null,
-              remainingShipmentQuantity: candidate ? remainingShipmentQuantity : null,
-            },
+            evidence: { orderId, expectedQuantity, candidateCount: candidates.length },
           },
         ));
       }
     }
+  }
+
+  for (const [allocationKey, group] of [...matchedReturnGroups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const candidate = group.candidate;
+    const ean = text(candidate.ean);
+    const metric = metricFor(ean);
+    const shipmentQuantity = integer(candidate.quantity_shipped);
+    const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
+    const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
+    const exactLineGms = numberValue(candidate._exact_line_gms) || 0;
+    const exactCommission = numberValue(candidate._exact_commission) || 0;
+
+    if (aggregateReturnQuantity <= shipmentQuantity) {
+      const allocationRatio = aggregateReturnQuantity / shipmentQuantity;
+      metric.linkedReturns += aggregateReturnQuantity;
+      metric.linkedReturnGms += exactLineGms * allocationRatio;
+      metric.linkedReturnCommission += exactCommission * allocationRatio;
+      continue;
+    }
+
+    metric.unlinkedReturns += aggregateReturnQuantity;
+    unmatchedReturnUnits += aggregateReturnQuantity;
+    const limitation = "No return in the shipment group received a financial allocation because aggregate RMA quantity exceeds shipped quantity.";
+    metric.limitations.push(limitation);
+    exceptions.push(exception(
+      "RETURN_GROUP_QUANTITY_EXCEEDS_SHIPMENT",
+      "return_adjusted_trading",
+      "warning",
+      "Aggregate return quantity exceeds the uniquely matched shipment item",
+      `Shipment item ${allocationKey} has ${aggregateReturnQuantity} returned units against ${shipmentQuantity} shipped units; the complete group remains financially unallocated.`,
+      {
+        businessKey: allocationKey,
+        ean,
+        evidence: {
+          allocationPolicy: "all_or_none_by_unique_shipment_item",
+          shipmentId: candidate.shipment_id,
+          orderItemId: candidate.order_item_id,
+          shipmentQuantity,
+          aggregateReturnQuantity,
+          returnItems: groupedReturns,
+        },
+      },
+    ));
   }
 
   const unhandledRows = rows(operational.unhandledReturns);

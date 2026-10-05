@@ -1,6 +1,13 @@
 -- Switch future Retailer snapshots to transform v2 and enqueue one auditable v2
 -- candidate from the latest contract-3.0 source for each historical week.
 -- Deploy the v2 Edge worker first, and only while the transform queue is empty.
+-- Supabase applies each migration in one transaction. SHARE ROW EXCLUSIVE conflicts
+-- with the ROW EXCLUSIVE lock taken by source-run completion updates and transform
+-- claims/inserts, and both locks remain held until that migration transaction commits.
+lock table public.bol_retailer_api_extract_runs in share row exclusive mode;
+lock table pipeline.transform_runs in share row exclusive mode;
+
+-- Recheck every cutover precondition only after concurrent producers/workers are blocked.
 
 do $$
 begin

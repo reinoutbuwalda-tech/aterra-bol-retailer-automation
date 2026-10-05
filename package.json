@@ -12,7 +12,9 @@
     "test": "npm run verify",
     "test:unit": "node --test tests/rendered-html.test.mjs tests/retailer-cloud-extract.test.mjs tests/retailer-foundation-sql.test.mjs tests/retailer-transform.test.mjs skills/bol-retailer-weekly-report/scripts/test-generate-weekly-report.mjs",
     "test:migration": "node --test tests/retailer-migration.integration.test.mjs",
-    "verify": "npm run lint && npm run build && npm run test:unit && npm run test:migration",
+    "test:migration:full-chain": "node --test tests/retailer-full-chain.integration.test.mjs",
+    "verify:unit": "npm run lint && npm run build && npm run test:unit",
+    "verify": "npm run verify:unit && npm run test:migration",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "verify:benchmark": "node scripts/verify-may-benchmark.mjs"
   },

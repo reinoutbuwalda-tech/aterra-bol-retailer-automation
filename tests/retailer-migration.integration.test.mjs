@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -23,6 +23,28 @@ function psql(sql, { expectFailure = false } = {}) {
   }
   return result;
 }
+
+function psqlAsync(sql) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('psql', [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-qAt'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', status => {
+      if (status === 0) resolve({ stdout, stderr });
+      else reject(new Error(`Concurrent SQL failed with exit ${status}:\n${stderr}\n${stdout}`));
+    });
+    child.stdin.end(sql);
+  });
+}
+
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 function assertDedicatedDatabase() {
   const result = psql('select current_database();');
@@ -112,7 +134,24 @@ $$;
 create function pipeline.enqueue_bol_retailer_transform()
 returns trigger
 language plpgsql
-as $$ begin perform 'retailer-transform-v1'; return new; end $$;
+as $$
+declare transform_id uuid;
+begin
+  if old.status = 'running' and new.status in ('complete', 'partial') then
+    insert into pipeline.transform_runs (
+      source_run_id, source_contract_version, transform_version,
+      iso_year, iso_week, period_start, period_end
+    ) values (
+      new.id, new.source_schema_version, 'retailer-transform-v1',
+      new.iso_year, new.iso_week, new.period_start, new.period_end
+    ) returning id into transform_id;
+    perform pgmq.send(
+      'bol_retailer_transform',
+      jsonb_build_object('transformRunId', transform_id, 'transformVersion', 'retailer-transform-v1')
+    );
+  end if;
+  return new;
+end $$;
 create trigger enqueue_bol_retailer_transform
   after update on public.bol_retailer_api_extract_runs
   for each row execute function pipeline.enqueue_bol_retailer_transform();
@@ -122,9 +161,12 @@ function applyMigration() {
   psql(`begin;\n${migration}\ncommit;`);
 }
 
-const integrationTest = (name, fn) => test(name, {
-  skip: databaseUrl ? false : 'requires psql and RETAILER_MIGRATION_DATABASE_URL; CI supplies PostgreSQL 16',
-}, fn);
+if (!databaseUrl) {
+  throw new Error(
+    'Migration tests require psql and RETAILER_MIGRATION_DATABASE_URL pointing to retailer_migration_ci. Use npm run verify:unit for the database-free local gate.',
+  );
+}
+const integrationTest = test;
 
 integrationTest('v2 migration cuts over queueing and preserves stronger active revisions', () => {
   assertDedicatedDatabase();
@@ -190,6 +232,46 @@ integrationTest('v2 migration cuts over queueing and preserves stronger active r
     do $$ begin
       if (select id from reporting.data_product_revisions where is_active) <> '10000000-0000-4000-8000-000000000003'::uuid then
         raise exception 'weaker not-applicable revision displaced ready revision';
+      end if;
+    end $$;
+  `);
+});
+
+integrationTest('concurrent source completion cannot enqueue v1 during v2 cutover', async () => {
+  assertDedicatedDatabase();
+  psql(`${setupSql}
+    insert into public.bol_retailer_api_extract_runs values
+      ('15000000-0000-4000-8000-000000000001', 'running', '3.0', null, null, null, 2026, 42, '2026-10-12', '2026-10-18', now(), null);
+  `);
+
+  const pausedMigration = migration.replace(
+    'lock table pipeline.transform_runs in share row exclusive mode;',
+    "lock table pipeline.transform_runs in share row exclusive mode;\nselect pg_sleep(2);",
+  );
+  const migrationSession = psqlAsync(`begin;\n${pausedMigration}\ncommit;`);
+  await delay(400);
+  const completionSession = psqlAsync(String.raw`
+    update public.bol_retailer_api_extract_runs
+    set status = 'complete', storage_path = 'concurrent/manifest.json',
+        snapshot_sha256 = repeat('e', 64), artifact_count = 7, completed_at = now()
+    where id = '15000000-0000-4000-8000-000000000001';
+  `);
+  await Promise.all([migrationSession, completionSession]);
+
+  psql(String.raw`
+    do $$ begin
+      if exists (
+        select 1 from pipeline.transform_runs
+        where source_run_id = '15000000-0000-4000-8000-000000000001'
+          and transform_version = 'retailer-transform-v1'
+      ) then raise exception 'concurrent completion escaped through the v1 trigger'; end if;
+      if not exists (
+        select 1 from pipeline.transform_runs
+        where source_run_id = '15000000-0000-4000-8000-000000000001'
+          and transform_version = 'retailer-transform-v2'
+      ) then raise exception 'concurrent completion did not enqueue v2'; end if;
+      if (select count(*) from pgmq.test_queue where message->>'transformVersion' = 'retailer-transform-v2') <> 1 then
+        raise exception 'concurrent completion did not emit exactly one v2 message';
       end if;
     end $$;
   `);
