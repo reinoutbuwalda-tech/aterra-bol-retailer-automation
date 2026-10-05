@@ -564,6 +564,12 @@ test('a full return reverses the exact recurring-decimal shipment total and comm
 
   const publication = await context.buildPublication(claim, loaded);
   const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887511');
+  const persistedLine = publication.facts.outbound_shipment_items.find(row => row.ean === '8720892887511');
+  assert.equal(persistedLine.unit_price, 29.56);
+  assert.equal(persistedLine.exact_unit_price, 206.93 / 7);
+  assert.equal(persistedLine.exact_line_gms, (206.93 / 7) * 7);
+  assert.equal(Math.round(persistedLine.exact_line_gms * 100) / 100, metric.gross_shipped_gms);
+  assert.equal(Math.round(persistedLine.exact_commission * 100) / 100, metric.gross_commission);
   assert.equal(metric.gross_shipped_gms, 206.93);
   assert.equal(metric.linked_return_gms, 206.93);
   assert.equal(metric.provisional_net_gms, 0);
@@ -621,7 +627,21 @@ test('sub-cent multiple-line publication rounds each accounting result from raw 
 
   const publication = await context.buildPublication(claim, loaded);
   const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
+  const persistedLines = publication.facts.outbound_shipment_items
+    .filter(row => row.ean === '8720892887504');
+  const persistedGross = persistedLines.reduce((sum, row) => sum + row.exact_line_gms, 0);
+  const persistedCommission = persistedLines.reduce((sum, row) => sum + row.exact_commission, 0);
+  const returnedLine = persistedLines.find(row => row.order_id === 'order-2');
   const raw = metric.calculation_trace.unroundedInputs;
+  assert.equal(persistedLines.length, 2);
+  assert.deepEqual(Array.from(persistedLines, row => row.exact_unit_price), [0.006, 0.006]);
+  assert.deepEqual(Array.from(persistedLines, row => row.unit_price), [0.01, 0.01]);
+  assert.equal(persistedGross, 0.012);
+  assert.equal(persistedCommission, 0.012);
+  assert.equal(Math.round(persistedGross * 100) / 100, metric.gross_shipped_gms);
+  assert.equal(Math.round(persistedCommission * 100) / 100, metric.gross_commission);
+  assert.equal(Math.round(returnedLine.exact_line_gms * 100) / 100, metric.linked_return_gms);
+  assert.equal(Math.round(returnedLine.exact_commission * 100) / 100, metric.linked_return_commission);
   assert.equal(metric.gross_shipped_units, 2);
   assert.equal(metric.gross_shipped_gms, 0.01);
   assert.equal(metric.linked_return_gms, 0.01);

@@ -214,5 +214,5 @@ from pipeline.source_artifacts
 order by checked_at desc;
 ```
 
-See `docs/bol-retailer-cloud-operations.md` for scheduling, failure handling, and
+See the [Retailer cloud operations runbook](bol-retailer-cloud-operations.md) for scheduling, failure handling, and
 operational checks.

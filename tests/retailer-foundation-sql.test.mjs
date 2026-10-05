@@ -109,12 +109,35 @@ test('transform v2 is versioned consistently and backfills only the latest sourc
   assert.match(transformV2, /queue_length from pgmq\.metrics\('bol_retailer_transform'\)/);
 });
 
-test('a later data-product revision cannot replace a strictly better active revision', () => {
+test('a later data-product revision cannot replace a strictly better eligible active revision', () => {
   assert.match(transformV2, /create trigger keep_best_active_data_product_revision/);
   assert.match(transformV2, /when 'ready' then 3/);
   assert.match(transformV2, /when 'ready_with_limits' then 2/);
   assert.match(transformV2, /when 'not_applicable' then 1/);
+  assert.match(transformV2, /revision\.activation_eligible/);
   assert.match(transformV2, /end > new_readiness/);
   assert.match(transformV2, /set is_active = false,\s+activated_at = null\s+where id = new\.id/s);
   assert.match(transformV2, /set is_active = true,\s+activated_at = coalesce\(activated_at, now\(\)\)\s+where id = better_revision_id/s);
+});
+
+test('v2 revisions support durable invalidation without conflating ordinary replacement', () => {
+  assert.match(transformV2, /add column activation_eligible boolean/);
+  assert.match(transformV2, /set activation_eligible = is_active/);
+  assert.match(transformV2, /Pre-v2 inactive revision quarantined during eligibility cutover/);
+  assert.match(transformV2, /alter column activation_eligible set default true/);
+  assert.match(transformV2, /alter column activation_eligible set not null/);
+  assert.match(transformV2, /create or replace function reporting\.invalidate_data_product_revision/);
+  assert.match(transformV2, /set activation_eligible = false,\s+is_active = false/s);
+  assert.match(transformV2, /not activation_eligible\s+and not is_active/s);
+});
+
+test('v2 shipment facts persist exact valuation inputs used by reports', () => {
+  assert.match(transformV2, /add column exact_unit_price numeric/);
+  assert.match(transformV2, /add column exact_commission numeric/);
+  assert.match(transformV2, /add column exact_line_gms numeric/);
+  assert.match(transformWorker, /exact_unit_price: unitPrice/);
+  assert.match(transformWorker, /exact_commission: commission/);
+  assert.match(transformWorker, /exact_line_gms: quantityShipped \* unitPrice/);
+  assert.match(transformWorker, /metric\.grossGms \+= numberValue\(persistedItem\.exact_line_gms\)/);
+  assert.doesNotMatch(transformWorker, /_exact_line_gms|_exact_commission/);
 });

@@ -59,10 +59,12 @@ const setupSql = String.raw`
 drop schema if exists reporting cascade;
 drop schema if exists pipeline cascade;
 drop schema if exists pgmq cascade;
+drop schema if exists bol_retailer cascade;
 drop table if exists public.bol_retailer_api_extract_runs cascade;
 create schema reporting;
 create schema pipeline;
 create schema pgmq;
+create schema bol_retailer;
 do $$ begin
   if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon; end if;
   if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated; end if;
@@ -81,6 +83,20 @@ create table public.bol_retailer_api_extract_runs (
   period_end date not null,
   started_at timestamptz not null,
   completed_at timestamptz
+);
+
+create table bol_retailer.outbound_shipment_items (
+  id uuid primary key default gen_random_uuid(),
+  business_key text not null,
+  semantic_hash text not null,
+  shipment_id text not null,
+  order_id text,
+  order_item_id text not null,
+  ean text not null,
+  quantity_shipped integer not null,
+  unit_price numeric(14, 2) not null,
+  commission numeric(14, 2) not null,
+  unique (business_key, semantic_hash)
 );
 
 create table pipeline.transform_runs (
@@ -174,6 +190,8 @@ integrationTest('v2 migration cuts over queueing and preserves stronger active r
     insert into public.bol_retailer_api_extract_runs values
       ('00000000-0000-4000-8000-000000000001', 'complete', '3.0', 'old/manifest.json', repeat('a', 64), 7, 2026, 39, '2026-09-21', '2026-09-27', '2026-09-28T08:00:00Z', '2026-09-28T09:00:00Z'),
       ('00000000-0000-4000-8000-000000000002', 'complete', '3.0', 'new/manifest.json', repeat('b', 64), 7, 2026, 39, '2026-09-21', '2026-09-27', '2026-09-28T10:00:00Z', '2026-09-28T11:00:00Z');
+    insert into reporting.data_product_revisions values
+      ('09000000-0000-4000-8000-000000000001', 'historical_product', 2026, 39, 1, 'ready', false, null);
   `);
   applyMigration();
 
@@ -206,33 +224,84 @@ integrationTest('v2 migration cuts over queueing and preserves stronger active r
       ) then raise exception 'future terminal source did not queue as v2'; end if;
     end $$;
 
-    insert into reporting.data_product_revisions values
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
+      ('09000000-0000-4000-8000-000000000002', 'historical_product', 2026, 39, 2, 'ready_with_limits', true, now());
+    do $$ begin
+      if (select id from reporting.data_product_revisions where data_product = 'historical_product' and is_active)
+          <> '09000000-0000-4000-8000-000000000002'::uuid then
+        raise exception 'pre-v2 inactive stronger revision was reactivated';
+      end if;
+      if exists (
+        select 1 from reporting.data_product_revisions
+        where id = '09000000-0000-4000-8000-000000000001'
+          and (activation_eligible or invalidated_at is null or invalidation_reason is null)
+      ) then raise exception 'pre-v2 inactive revision was not durably quarantined'; end if;
+    end $$;
+
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
       ('10000000-0000-4000-8000-000000000001', 'product_visits', 2026, 39, 1, 'ready', true, now());
-    update reporting.data_product_revisions set is_active = false where is_active;
-    insert into reporting.data_product_revisions values
+    update reporting.data_product_revisions set is_active = false where data_product = 'product_visits' and is_active;
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
       ('10000000-0000-4000-8000-000000000002', 'product_visits', 2026, 39, 2, 'ready_with_limits', true, now());
     do $$ begin
-      if (select id from reporting.data_product_revisions where is_active) <> '10000000-0000-4000-8000-000000000001'::uuid then
+      if (select id from reporting.data_product_revisions where data_product = 'product_visits' and is_active) <> '10000000-0000-4000-8000-000000000001'::uuid then
         raise exception 'weaker revision displaced stronger revision';
       end if;
     end $$;
 
-    update reporting.data_product_revisions set is_active = false where is_active;
-    insert into reporting.data_product_revisions values
+    update reporting.data_product_revisions set is_active = false where data_product = 'product_visits' and is_active;
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
       ('10000000-0000-4000-8000-000000000003', 'product_visits', 2026, 39, 3, 'ready', true, now());
     do $$ begin
-      if (select id from reporting.data_product_revisions where is_active) <> '10000000-0000-4000-8000-000000000003'::uuid then
+      if (select id from reporting.data_product_revisions where data_product = 'product_visits' and is_active) <> '10000000-0000-4000-8000-000000000003'::uuid then
         raise exception 'equally ready newer revision did not become active';
       end if;
     end $$;
 
-    update reporting.data_product_revisions set is_active = false where is_active;
-    insert into reporting.data_product_revisions values
+    update reporting.data_product_revisions set is_active = false where data_product = 'product_visits' and is_active;
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
       ('10000000-0000-4000-8000-000000000004', 'product_visits', 2026, 39, 4, 'not_applicable', true, now());
     do $$ begin
-      if (select id from reporting.data_product_revisions where is_active) <> '10000000-0000-4000-8000-000000000003'::uuid then
+      if (select id from reporting.data_product_revisions where data_product = 'product_visits' and is_active) <> '10000000-0000-4000-8000-000000000003'::uuid then
         raise exception 'weaker not-applicable revision displaced ready revision';
       end if;
+    end $$;
+
+    select reporting.invalidate_data_product_revision(
+      '10000000-0000-4000-8000-000000000003',
+      'source evidence withdrawn'
+    );
+    insert into reporting.data_product_revisions
+      (id, data_product, iso_year, iso_week, revision_number, status, is_active, activated_at)
+    values
+      ('10000000-0000-4000-8000-000000000005', 'product_visits', 2026, 39, 5, 'ready_with_limits', true, now());
+    do $$ begin
+      if (select id from reporting.data_product_revisions where data_product = 'product_visits' and is_active) <> '10000000-0000-4000-8000-000000000005'::uuid then
+        raise exception 'invalidated stronger revision was reactivated';
+      end if;
+      if exists (
+        select 1 from reporting.data_product_revisions
+        where id = '10000000-0000-4000-8000-000000000003'
+          and (activation_eligible or invalidated_at is null or invalidation_reason <> 'source evidence withdrawn')
+      ) then raise exception 'revision invalidation metadata was not durable'; end if;
+      if not exists (
+        select 1 from information_schema.columns
+        where table_schema = 'bol_retailer'
+          and table_name = 'outbound_shipment_items'
+          and column_name in ('exact_unit_price', 'exact_commission', 'exact_line_gms')
+        group by table_schema, table_name
+        having count(*) = 3
+      ) then raise exception 'exact shipment valuation columns are missing'; end if;
     end $$;
   `);
 });

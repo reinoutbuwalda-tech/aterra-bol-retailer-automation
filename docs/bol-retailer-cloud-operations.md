@@ -107,27 +107,16 @@ the JSON backup rather than appearing as extra review tabs.
 
 ## Transform v2 rollout
 
-`retailer-transform-v2` is prepared but must be released in this order so a queue
-message can never be interpreted by the wrong transform semantics:
+`retailer-transform-v2` is prepared, but the v1-to-v2 handoff must be performed with all producers and consumers under explicit control. Deploying the v2 worker before the migration can permanently reject a valid v1 message, so do not use a worker-first cutover.
 
-1. Confirm there are no `queued`, `processing`, or `retry_wait` transform runs and the
-   pgmq queue has no visible or in-flight messages. At migration start, the source-run
-   and transform-run tables are locked in a mode that conflicts with completion updates,
-   claims, and inserts; the migration then rechecks both conditions while retaining those
-   locks through commit.
-2. Deploy the v2 Edge worker. Do not invoke an extraction during this short interval.
-3. Apply `20260930155322_retailer_transform_v2_contract.sql`. The migration refuses to
-   switch versions while a transform run is nonterminal.
-4. The migration changes future enqueue messages to v2 and queues one candidate from
-   the latest contract-3.0 source for each historical ISO week.
-5. Let the five-minute worker process those candidates. Confirm v2 runs are terminal,
-   the queue is empty, and lower-readiness candidates did not replace better active
-   reports.
-6. Compare v1 and v2 revision totals, data-product statuses, quality checks, exceptions,
-   and source-artifact integrity before treating the rollout as complete.
+1. Freeze the weekly extraction and retry schedules so no new v1 work can be created. Record which schedules were enabled before the change.
+2. Keep the v1 transform worker schedule active until every existing v1 message has drained. Confirm all transform runs are terminal and `pgmq.metrics('bol_retailer_transform')` reports zero visible and in-flight messages.
+3. Freeze the transform-worker schedule and block manual worker invocation. Recheck the source-run and transform-run tables and the queue while all schedules remain frozen.
+4. Apply `20260930155322_retailer_transform_v2_contract.sql` while the v1 worker is still deployed but cannot run. The migration locks and rechecks the relevant tables, switches future enqueue messages to v2, and creates the historical v2 candidates.
+5. Deploy the v2 Edge worker, then re-enable only the transform-worker schedule. Let it process the migration-created candidates and confirm all v2 runs are terminal and the queue is empty.
+6. Compare v1 and v2 revision totals, data-product statuses, quality checks, exceptions, and source-artifact integrity. Re-enable extraction and retry schedules only after the comparison passes.
 
-The v2 worker rejects a v1 claim rather than silently applying new rules under an old
-lineage label. Rollback before step 3 is simply redeploying v1. After step 3, use this
+A release rehearsal must include the handoff case: a v1 message present when a v2 worker would otherwise become active must either drain under v1 before cutover or leave the cutover blocked. The v2 worker continues to reject v1 claims rather than silently applying new rules under an old lineage label. Rollback before step 3 is simply redeploying v1. After step 3, use this
 order; do not put a v1 worker in front of queued v2 messages:
 
 1. Freeze the extraction, transform-worker, and retry schedules so no new source run or

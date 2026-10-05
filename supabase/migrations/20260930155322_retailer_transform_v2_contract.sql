@@ -25,6 +25,93 @@ begin
 end;
 $$;
 
+-- A revision can be inactive because a newer publication replaced it, or because
+-- an operator deliberately invalidated it. Keep those states separate so the
+-- readiness guard can restore only revisions that remain eligible.
+alter table reporting.data_product_revisions
+  add column activation_eligible boolean,
+  add column invalidated_at timestamptz,
+  add column invalidation_reason text;
+
+-- Before this migration, inactive encoded both supersession and invalidation.
+-- That history is ambiguous, so fail closed: only the revision active at the
+-- cutover remains eligible. Publications after the cutover deactivate rows
+-- without changing eligibility, preserving ordinary readiness replacement.
+update reporting.data_product_revisions
+set activation_eligible = is_active,
+    invalidated_at = case when is_active then null else now() end,
+    invalidation_reason = case
+      when is_active then null
+      else 'Pre-v2 inactive revision quarantined during eligibility cutover'
+    end;
+
+alter table reporting.data_product_revisions
+  alter column activation_eligible set default true,
+  alter column activation_eligible set not null,
+  add constraint data_product_revisions_invalidation_check check (
+    (
+      activation_eligible
+      and invalidated_at is null
+      and invalidation_reason is null
+    ) or (
+      not activation_eligible
+      and not is_active
+      and invalidated_at is not null
+      and nullif(btrim(invalidation_reason), '') is not null
+    )
+  );
+
+create index data_product_revisions_activation_eligible_idx
+  on reporting.data_product_revisions (data_product, iso_year, iso_week, revision_number desc)
+  where activation_eligible;
+
+create or replace function reporting.invalidate_data_product_revision(
+  p_revision_id uuid,
+  p_reason text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if nullif(btrim(p_reason), '') is null then
+    raise exception 'An invalidation reason is required' using errcode = '22023';
+  end if;
+
+  update reporting.data_product_revisions
+  set activation_eligible = false,
+      is_active = false,
+      activated_at = null,
+      invalidated_at = now(),
+      invalidation_reason = btrim(p_reason)
+  where id = p_revision_id
+    and activation_eligible;
+
+  return found;
+end;
+$$;
+
+revoke all on function reporting.invalidate_data_product_revision(uuid, text)
+from public, anon, authenticated;
+
+comment on function reporting.invalidate_data_product_revision(uuid, text) is
+  'Durably invalidates a revision so automated readiness protection cannot reactivate it.';
+
+-- Keep compatibility display amounts at two decimals, while persisting the
+-- exact v2 source valuation used by reports and return allocation. Nullable
+-- exact fields make pre-v2 rows explicitly distinguishable instead of
+-- pretending rounded historical values were exact.
+alter table bol_retailer.outbound_shipment_items
+  add column exact_unit_price numeric,
+  add column exact_commission numeric,
+  add column exact_line_gms numeric,
+  add constraint outbound_shipment_items_exact_valuation_check check (
+    (exact_unit_price is null and exact_commission is null and exact_line_gms is null)
+    or
+    (exact_unit_price is not null and exact_commission is not null and exact_line_gms is not null)
+  );
+
 create or replace function reporting.keep_best_active_data_product_revision()
 returns trigger
 language plpgsql
@@ -53,6 +140,7 @@ begin
     and revision.iso_year = new.iso_year
     and revision.iso_week = new.iso_week
     and revision.id <> new.id
+    and revision.activation_eligible
     and case revision.status
       when 'ready' then 3
       when 'ready_with_limits' then 2

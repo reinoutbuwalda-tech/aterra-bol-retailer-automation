@@ -30,13 +30,9 @@ Database schema changes are stored in `supabase/migrations` and must pass Supaba
 
 ## Bol data foundation
 
-- `docs/bol-retailer-data-foundation.md` explains the current Retailer data model,
-  schemas, weekly metrics, readiness states, and historical W36-W39 foundation.
-- `docs/bol-retailer-cloud-operations.md` explains the Monday extraction, Drive backup,
-  transform worker, v2 rollout order, and operational checks.
-- `docs/bol-data-foundation-roadmap.md` describes the overall goal, current state,
-  future state, and full build plan for Retailer, Advertising, reporting, and P&L
-  reconciliation.
+- [Architecture and traceability](docs/bol-retailer-data-foundation.md) explains the current Retailer data model, schemas, weekly metrics, readiness states, and historical W36-W39 foundation.
+- [Cloud operations and v2 rollout](docs/bol-retailer-cloud-operations.md) explains the Monday extraction, Drive backup, transform worker, safe v2 rollout order, and operational checks.
+- [Roadmap and remaining build plan](docs/bol-data-foundation-roadmap.md) describes the overall goal, verified repository state, future state, and full build plan for Retailer, Advertising, reporting, and P&L reconciliation.
 
 ## Automatic finance intake
 

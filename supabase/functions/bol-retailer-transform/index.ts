@@ -12,7 +12,7 @@ const MAX_MESSAGES_PER_INVOCATION = 2;
 const MAX_TRANSFORM_ATTEMPTS = 5;
 
 type JsonRecord = Record<string, unknown>;
-type SupabaseClient = SupabaseJsClient<any, "public", any>;
+type SupabaseClient = SupabaseJsClient;
 type Claim = {
   status: string;
   messageId: number;
@@ -579,24 +579,22 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         quantity_shipped: quantityShipped,
         unit_price: round(unitPrice, 2),
         commission: round(commission, 2),
+        exact_unit_price: unitPrice,
+        exact_commission: commission,
+        exact_line_gms: quantityShipped * unitPrice,
         fulfilment_method: nullableText(fulfilment.method),
         distribution_party: nullableText(fulfilment.distributionParty),
         latest_delivery_date: isoDate(fulfilment.latestDeliveryDate),
       };
       const sourcePointer = `/operational/shipmentDetails/${shipmentIndex}/detail/shipmentItems/${itemIndex}`;
-      facts.outbound_shipment_items.push(await fact(itemFields, `${shipmentId}|${orderItemId}`, "commercial", sourcePointer, shipmentAt, now));
-      const candidate = {
-        ...itemFields,
-        sourcePointer,
-        _exact_line_gms: quantityShipped * unitPrice,
-        _exact_commission: commission,
-      };
+      const persistedItem = await fact(itemFields, `${shipmentId}|${orderItemId}`, "commercial", sourcePointer, shipmentAt, now);
+      facts.outbound_shipment_items.push(persistedItem);
       const matchKey = `${orderId || ""}|${ean}`;
-      shipmentCandidates.set(matchKey, [...(shipmentCandidates.get(matchKey) || []), candidate]);
+      shipmentCandidates.set(matchKey, [...(shipmentCandidates.get(matchKey) || []), persistedItem]);
       const metric = metricFor(ean);
-      metric.grossUnits += quantityShipped;
-      metric.grossGms += quantityShipped * unitPrice;
-      metric.grossCommission += commission;
+      metric.grossUnits += integer(persistedItem.quantity_shipped);
+      metric.grossGms += numberValue(persistedItem.exact_line_gms) || 0;
+      metric.grossCommission += numberValue(persistedItem.exact_commission) || 0;
     }
   }
 
@@ -743,8 +741,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const shipmentQuantity = integer(candidate.quantity_shipped);
     const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
     const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
-    const exactLineGms = numberValue(candidate._exact_line_gms) || 0;
-    const exactCommission = numberValue(candidate._exact_commission) || 0;
+    const exactLineGms = numberValue(candidate.exact_line_gms) || 0;
+    const exactCommission = numberValue(candidate.exact_commission) || 0;
 
     if (aggregateReturnQuantity <= shipmentQuantity) {
       const allocationRatio = aggregateReturnQuantity / shipmentQuantity;
