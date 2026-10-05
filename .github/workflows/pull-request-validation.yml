@@ -75,6 +75,7 @@ jobs:
       - name: Apply every migration preceding retailer transform v2
         shell: bash
         run: |
+          cp tests/fixtures/supabase-product-master-prerequisite.sql supabase/migrations/20260801000000_test_product_master_prerequisite.sql
           cp supabase/migrations/20260930155322_retailer_transform_v2_contract.sql "$RUNNER_TEMP/retailer_transform_v2_contract.sql"
           rm supabase/migrations/20260930155322_retailer_transform_v2_contract.sql
           supabase init --force

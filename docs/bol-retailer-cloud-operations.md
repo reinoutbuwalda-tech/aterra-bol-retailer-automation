@@ -187,10 +187,14 @@ database-free local command. The fast harness uses a minimal pgmq substitute and
 migration branching, two-session locking, revision promotion, and transaction rollback;
 it does not claim to prove the full Supabase extension chain.
 
-CI separately removes v2 from the migration directory, applies every preceding migration
-with Supabase CLI `2.119.0`, verifies the real pgmq extension and v1 state, then applies
-the actual v2 migration while a second session attempts source completion. That full-
-chain job is the release evidence for extension compatibility and the cutover race.
+CI separately supplies a minimal test-only `public.products` product-master prerequisite
+because that pre-existing application table predates this repository's migrations. It
+then removes v2 from the migration directory, applies every repository migration with
+Supabase CLI `2.119.0`, verifies the real pgmq extension and v1 state, and applies the
+actual v2 migration while a second session attempts source completion. The product
+fixture defines only the IDs and columns referenced by the repository chain; it is not a
+substitute for pgmq, transform tables, triggers, or migration behavior. That full-chain
+job is the release evidence for extension compatibility and the cutover race.
 
 `node --test tests/retailer-cloud-extract.test.mjs` runs the collector regression cases.
 The 19 September cloud validation made 221 API calls with zero final API errors,
