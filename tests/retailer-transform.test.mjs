@@ -1385,6 +1385,54 @@ test('optional invoice header totals remain null only when absent', async () => 
   }
 });
 
+test('raw financial JSON numbers reject exponent notation and excess lexical precision', () => {
+  const context = transformer();
+  const invalidSources = [
+    '{"settlement":{"invoices":[{"legalMonetaryTotal":{"payableAmount":{"amount":1e2}}}],"invoiceDetails":[],"invoiceSpecifications":[]}}',
+    '{"settlement":{"invoices":[{"legalMonetaryTotal":{"payableAmount":{"amount":1e-1}}}],"invoiceDetails":[],"invoiceSpecifications":[]}}',
+    '{"settlement":{"invoices":[],"invoiceDetails":[],"invoiceSpecifications":[{"lines":[{"lineExtensionAmount":{"amount":0.100000000000000005}}]}]}}',
+  ];
+  for (const raw of invalidSources) {
+    assert.throws(
+      () => context.parseJson(raw, 'financial.json'),
+      error => error.code === 'INVALID_FINANCIAL_JSON_NUMBER',
+    );
+  }
+});
+
+test('invoice collections reject primitive members instead of filtering them', async () => {
+  const cases = [
+    ['INVALID_INVOICE_HEADERS', input => input.loaded.artifacts.financial.settlement.invoices.push(42)],
+    ['INVALID_INVOICE_SPECIFICATIONS', input => input.loaded.artifacts.financial.settlement.invoiceSpecifications.push('invalid')],
+    ['INVALID_INVOICE_SPECIFICATION_LINES', input => input.loaded.artifacts.financial.settlement.invoiceSpecifications[0].lines.push(false)],
+  ];
+  for (const [code, mutate] of cases) {
+    const context = transformer();
+    const input = canonicalInvoiceInput();
+    mutate(input);
+    await assert.rejects(
+      context.buildPublication(input.claim, input.loaded),
+      error => error.code === code,
+    );
+  }
+});
+
+test('invoice collection shapes must be arrays', async () => {
+  const cases = [
+    ['invoices', 'INVALID_INVOICE_HEADERS'],
+    ['invoiceSpecifications', 'INVALID_INVOICE_SPECIFICATIONS'],
+  ];
+  for (const [field, code] of cases) {
+    const context = transformer();
+    const input = canonicalInvoiceInput();
+    input.loaded.artifacts.financial.settlement[field] = {};
+    await assert.rejects(
+      context.buildPublication(input.claim, input.loaded),
+      error => error.code === code,
+    );
+  }
+});
+
 test('required invoice payable and line amounts reject malformed source values', async () => {
   const invalidValues = [undefined, null, true, [], {}, '', '1.00', ' 1 ', 1e-7, 0.12345678901234567, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
   for (const [target, code] of [['payable', 'INVALID_INVOICE_PAYABLE_AMOUNT'], ['line', 'INVALID_INVOICE_LINE_AMOUNT']]) {

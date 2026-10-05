@@ -12,6 +12,9 @@ const MAX_MESSAGES_PER_INVOCATION = 2;
 const MAX_TRANSFORM_ATTEMPTS = 5;
 
 type JsonRecord = Record<string, unknown>;
+type JsonPathSegment = string | number;
+type RawJsonNumber = { path: JsonPathSegment[]; source: string };
+const RAW_JSON_NUMBER_SOURCES = new WeakMap<object, Map<string, string>>();
 type SupabaseClient = SupabaseJsClient<any, "public", any>;
 type Claim = {
   status: string;
@@ -99,6 +102,18 @@ function rows(value: unknown): JsonRecord[] {
   return Array.isArray(value) ? value.filter(item => item && typeof item === "object" && !Array.isArray(item)) as JsonRecord[] : [];
 }
 
+function contractRows(value: unknown, code: string, label: string): JsonRecord[] {
+  assertContract(Array.isArray(value), code, `${label} must be an array.`);
+  assertContract(value.every(isRecord), code, `${label} must contain only objects.`);
+  return value as JsonRecord[];
+}
+
+function rawJsonNumberSource(container: unknown, key: string | number) {
+  return container && typeof container === "object"
+    ? RAW_JSON_NUMBER_SOURCES.get(container)?.get(String(key))
+    : undefined;
+}
+
 function text(value: unknown): string {
   return value === null || value === undefined ? "" : String(value);
 }
@@ -144,13 +159,13 @@ function strictJsonDecimal(
   value: unknown,
   code: string,
   label: string,
-  options: { allowNegative?: boolean; maxSignificantDigits?: number } = {},
+  options: { allowNegative?: boolean; maxSignificantDigits?: number; rawSource?: string } = {},
 ): DecimalFraction {
   const allowNegative = options.allowNegative ?? true;
   const maxSignificantDigits = options.maxSignificantDigits ?? 16;
   assertContract(typeof value === "number" && Number.isFinite(value), code, `${label} must be a finite JSON number.`);
   assertContract(!Number.isInteger(value) || Number.isSafeInteger(value), code, `${label} exceeds safe integer precision.`);
-  const source = String(value);
+  const source = options.rawSource ?? String(value);
   assertContract(!/[eE]/.test(source), code, `${label} must not use exponent notation.`);
   const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(source);
   assertContract(match, code, `${label} must use canonical decimal notation.`);
@@ -208,25 +223,29 @@ function decimalTextFromScaled(value: bigint, scaleDigits = 4) {
   return `${sign}${absolute / scale}${fraction ? `.${fraction}` : ""}`;
 }
 
-function amountScalar(value: unknown): unknown {
-  if (!isRecord(value)) return value;
-  if ("amount" in value) return value.amount;
-  if ("value" in value) return value.value;
-  return value;
+function amountScalar(value: unknown, rawSource?: string): { value: unknown; rawSource?: string } {
+  if (!isRecord(value)) return { value, rawSource };
+  if ("amount" in value) return { value: value.amount, rawSource: rawJsonNumberSource(value, "amount") };
+  if ("value" in value) return { value: value.value, rawSource: rawJsonNumberSource(value, "value") };
+  return { value, rawSource };
 }
 
 function databaseDecimal(
   value: unknown,
   code: string,
   label: string,
-  options: { required?: boolean; allowNegative?: boolean; scaleDigits?: number; minScaled?: bigint; maxScaled?: bigint } = {},
+  options: { required?: boolean; allowNegative?: boolean; scaleDigits?: number; minScaled?: bigint; maxScaled?: bigint; rawSource?: string } = {},
 ): ExactDatabaseDecimal | null {
   if (value === null || value === undefined) {
     assertContract(!options.required, code, `${label} is required.`);
     return null;
   }
   const scaleDigits = options.scaleDigits ?? 4;
-  const fraction = strictJsonDecimal(amountScalar(value), code, label, { allowNegative: options.allowNegative });
+  const scalar = amountScalar(value, options.rawSource);
+  const fraction = strictJsonDecimal(scalar.value, code, label, {
+    allowNegative: options.allowNegative,
+    rawSource: scalar.rawSource,
+  });
   const scaledNumerator = fraction.numerator * (10n ** BigInt(scaleDigits));
   assertContract(scaledNumerator % fraction.denominator === 0n, code, `${label} supports at most ${scaleDigits} decimal places.`);
   const scaled = scaledNumerator / fraction.denominator;
@@ -390,12 +409,137 @@ async function downloadObject(supabase: SupabaseClient, bucket: string, path: st
   return { bytes, text: new TextDecoder().decode(bytes), sha256: await sha256Hex(bytes) };
 }
 
+function financialNumberScale(label: string, path: JsonPathSegment[]): number | null | undefined {
+  const names = path.filter((part): part is string => typeof part === "string").map(part => part.toLowerCase());
+  const leaf = names.at(-1) || "";
+  const parent = names.at(-2) || "";
+  const semantic = leaf === "amount" || leaf === "value" ? parent : leaf;
+  if (label === "commercial.json" && ["unitprice", "totalprice", "commission"].includes(semantic)) return null;
+  if (label === "catalog.json" && ["unitprice", "fixedamount", "percentage", "totalcost", "totalcostwithoutreduction"].includes(semantic)) return null;
+  if (label !== "financial.json" || !names.includes("settlement")) return undefined;
+  if (["payableamount", "taxexclusiveamount", "taxinclusiveamount"].includes(semantic)) return 2;
+  if (["quantity", "invoicedquantity", "lineextensionamount", "priceamount", "taxamount", "taxpercentage", "percent"].includes(semantic)) return 4;
+  return undefined;
+}
+
+function validateRawFinancialNumber(label: string, token: RawJsonNumber) {
+  const scale = financialNumberScale(label, token.path);
+  if (scale === undefined) return;
+  const pointer = `/${token.path.join("/")}`;
+  assertContract(!/[eE]/.test(token.source), "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} must not use exponent notation.`);
+  const match = /^-?(\d+)(?:\.(\d+))?$/.exec(token.source);
+  assertContract(match, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} must use canonical decimal notation.`);
+  const significantDigits = `${match[1]}${match[2] || ""}`.replace(/^0+/, "").length || 1;
+  assertContract(significantDigits <= 16, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} exceeds supported decimal precision.`);
+  if (scale !== null) {
+    assertContract((match[2]?.length || 0) <= scale, "INVALID_FINANCIAL_JSON_NUMBER", `${label} financial number at ${pointer} supports at most ${scale} decimal places.`);
+  }
+}
+
+function collectRawJsonNumbers(textValue: string, label: string): RawJsonNumber[] {
+  let index = 0;
+  const tokens: RawJsonNumber[] = [];
+  const whitespace = () => {
+    while (/\s/.test(textValue[index] || "")) index += 1;
+  };
+  const fail = (message: string): never => { throw new SyntaxError(`${message} at character ${index}`); };
+  const parseString = () => {
+    const start = index;
+    if (textValue[index] !== '"') fail("Expected string");
+    index += 1;
+    while (index < textValue.length) {
+      if (textValue[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (textValue[index] === '"') {
+        index += 1;
+        return JSON.parse(textValue.slice(start, index)) as string;
+      }
+      index += 1;
+    }
+    return fail("Unterminated string");
+  };
+  const parseValue = (path: JsonPathSegment[]): void => {
+    whitespace();
+    const character = textValue[index];
+    if (character === "{") {
+      index += 1;
+      whitespace();
+      if (textValue[index] === "}") { index += 1; return; }
+      while (index < textValue.length) {
+        const key = parseString();
+        whitespace();
+        if (textValue[index] !== ":") fail("Expected colon");
+        index += 1;
+        parseValue([...path, key]);
+        whitespace();
+        if (textValue[index] === "}") { index += 1; return; }
+        if (textValue[index] !== ",") fail("Expected comma");
+        index += 1;
+        whitespace();
+      }
+      fail("Unterminated object");
+    }
+    if (character === "[") {
+      index += 1;
+      whitespace();
+      if (textValue[index] === "]") { index += 1; return; }
+      let itemIndex = 0;
+      while (index < textValue.length) {
+        parseValue([...path, itemIndex]);
+        itemIndex += 1;
+        whitespace();
+        if (textValue[index] === "]") { index += 1; return; }
+        if (textValue[index] !== ",") fail("Expected comma");
+        index += 1;
+      }
+      fail("Unterminated array");
+    }
+    if (character === '"') { parseString(); return; }
+    for (const literal of ["true", "false", "null"]) {
+      if (textValue.startsWith(literal, index)) { index += literal.length; return; }
+    }
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(textValue.slice(index));
+    if (!match) fail("Expected JSON value");
+    const token = { path, source: match[0] };
+    validateRawFinancialNumber(label, token);
+    tokens.push(token);
+    index += match[0].length;
+  };
+
+  parseValue([]);
+  whitespace();
+  if (index !== textValue.length) fail("Unexpected trailing content");
+  return tokens;
+}
+
+function attachRawJsonNumbers(root: JsonRecord, tokens: RawJsonNumber[]) {
+  for (const token of tokens) {
+    let parent: unknown = root;
+    for (const segment of token.path.slice(0, -1)) {
+      if (!parent || typeof parent !== "object") break;
+      parent = (parent as Record<string | number, unknown>)[segment];
+    }
+    const key = token.path.at(-1);
+    if (!parent || typeof parent !== "object" || key === undefined) continue;
+    const sources = RAW_JSON_NUMBER_SOURCES.get(parent) || new Map<string, string>();
+    sources.set(String(key), token.source);
+    RAW_JSON_NUMBER_SOURCES.set(parent, sources);
+  }
+}
+
 function parseJson(textValue: string, label: string): JsonRecord {
   try {
+    const rawNumbers = ["commercial.json", "catalog.json", "financial.json"].includes(label)
+      ? collectRawJsonNumbers(textValue, label)
+      : [];
     const parsed = JSON.parse(textValue);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("root is not an object");
+    attachRawJsonNumbers(parsed as JsonRecord, rawNumbers);
     return parsed as JsonRecord;
   } catch (error) {
+    if (error instanceof PermanentTransformError) throw error;
     throw new PermanentTransformError("INVALID_JSON", `${label} is not valid JSON: ${error instanceof Error ? error.message : "parse failure"}`);
   }
 }
@@ -561,21 +705,30 @@ function invoiceLineFields(line: JsonRecord, invoiceId: string, index: number) {
   const properties = additionalProperties(line);
   const transactionType = text(line.type ?? record(item.Name ?? item.name).value ?? item.Name ?? item.name);
   const lineRef = text(line.invoiceLineRef ?? line.InvoiceLineRef ?? `${invoiceId}#${transactionType || "LINE"}`);
-  const lineAmountObject = line.lineExtensionAmount ?? line.LineExtensionAmount;
-  const quantitySource = line.quantity ?? ("InvoicedQuantity" in line ? line.InvoicedQuantity : undefined);
-  const priceSource = line.priceAmount ?? record(line.Price).PriceAmount;
-  const taxAmountSource = line.taxAmount ?? taxTotalRecord.TaxAmount ?? taxTotalRecord.taxAmount;
-  const taxPercentageSource = line.taxPercentage ?? record(taxCategories[0]?.Percent).value ?? taxCategories[0]?.Percent;
-  const lineAmount = databaseDecimal(lineAmountObject, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount`, { required: true });
+  const lineAmountKey = "lineExtensionAmount" in line ? "lineExtensionAmount" : "LineExtensionAmount";
+  const lineAmountObject = line[lineAmountKey];
+  const quantityKey = "quantity" in line ? "quantity" : "InvoicedQuantity";
+  const quantitySource = line[quantityKey];
+  const priceContainer = "priceAmount" in line ? line : record(line.Price);
+  const priceKey = "priceAmount" in line ? "priceAmount" : "PriceAmount";
+  const priceSource = priceContainer[priceKey];
+  const taxAmountKey = "taxAmount" in line ? "taxAmount" : "TaxAmount" in taxTotalRecord ? "TaxAmount" : "taxAmount";
+  const taxAmountContainer = "taxAmount" in line ? line : taxTotalRecord;
+  const taxAmountSource = taxAmountContainer[taxAmountKey];
+  const firstTaxCategory = taxCategories[0];
+  const taxPercentageContainer = "taxPercentage" in line ? line : isRecord(firstTaxCategory?.Percent) ? firstTaxCategory.Percent : firstTaxCategory;
+  const taxPercentageKey = "taxPercentage" in line ? "taxPercentage" : isRecord(firstTaxCategory?.Percent) ? "value" : "Percent";
+  const taxPercentageSource = taxPercentageContainer?.[taxPercentageKey];
+  const lineAmount = databaseDecimal(lineAmountObject, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount`, { required: true, rawSource: rawJsonNumberSource(line, lineAmountKey) });
   assertContract(lineAmount, "INVALID_INVOICE_LINE_AMOUNT", `Invoice ${invoiceId} line ${index} lineExtensionAmount is required.`);
-  const quantity = databaseDecimal(quantitySource, "INVALID_INVOICE_QUANTITY", `Invoice ${invoiceId} line ${index} quantity`);
-  const priceAmount = databaseDecimal(priceSource, "INVALID_INVOICE_PRICE_AMOUNT", `Invoice ${invoiceId} line ${index} priceAmount`);
-  const parsedTaxAmount = databaseDecimal(taxAmountSource, "INVALID_INVOICE_TAX_AMOUNT", `Invoice ${invoiceId} line ${index} taxAmount`);
+  const quantity = databaseDecimal(quantitySource, "INVALID_INVOICE_QUANTITY", `Invoice ${invoiceId} line ${index} quantity`, { rawSource: rawJsonNumberSource(line, quantityKey) });
+  const priceAmount = databaseDecimal(priceSource, "INVALID_INVOICE_PRICE_AMOUNT", `Invoice ${invoiceId} line ${index} priceAmount`, { rawSource: rawJsonNumberSource(priceContainer, priceKey) });
+  const parsedTaxAmount = databaseDecimal(taxAmountSource, "INVALID_INVOICE_TAX_AMOUNT", `Invoice ${invoiceId} line ${index} taxAmount`, { rawSource: rawJsonNumberSource(taxAmountContainer, taxAmountKey) });
   const taxPercentage = databaseDecimal(
     taxPercentageSource,
     "INVALID_INVOICE_TAX_PERCENTAGE",
     `Invoice ${invoiceId} line ${index} taxPercentage`,
-    { allowNegative: false, minScaled: 0n, maxScaled: 1_000_000n },
+    { allowNegative: false, minScaled: 0n, maxScaled: 1_000_000n, rawSource: rawJsonNumberSource(taxPercentageContainer, taxPercentageKey) },
   );
   return {
     invoice_id: invoiceId,
@@ -712,13 +865,13 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         item.unitPrice,
         "INVALID_SHIPMENT_UNIT_PRICE",
         `Shipment ${shipmentId} item ${itemIndex} unitPrice`,
-        { allowNegative: false },
+        { allowNegative: false, rawSource: rawJsonNumberSource(item, "unitPrice") },
       );
       const commission = strictJsonDecimal(
         item.commission,
         "INVALID_SHIPMENT_COMMISSION",
         `Shipment ${shipmentId} item ${itemIndex} commission`,
-        { allowNegative: false },
+        { allowNegative: false, rawSource: rawJsonNumberSource(item, "commission") },
       );
       const lineGrossMinor = lineGrossToMinor(unitPrice, quantityShipped);
       const unitPriceMinor = moneyToMinor(unitPrice);
@@ -811,14 +964,14 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         "INVALID_ORDER_ITEM_QUANTITY",
         `Order item ${orderItemId} quantities must be nonnegative int32 JSON numbers.`,
       );
-      const unitPrice = strictJsonDecimal(item.unitPrice, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`, { allowNegative: false });
+      const unitPrice = strictJsonDecimal(item.unitPrice, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "unitPrice") });
       const unitPriceMinor = moneyToMinor(unitPrice);
       const totalPriceMinor = item.totalPrice === null || item.totalPrice === undefined
         ? lineGrossToMinor(unitPrice, quantity)
-        : moneyToMinor(strictJsonDecimal(item.totalPrice, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`, { allowNegative: false }));
+        : moneyToMinor(strictJsonDecimal(item.totalPrice, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "totalPrice") }));
       const commissionMinor = item.commission === null || item.commission === undefined
         ? null
-        : moneyToMinor(strictJsonDecimal(item.commission, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`, { allowNegative: false }));
+        : moneyToMinor(strictJsonDecimal(item.commission, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`, { allowNegative: false, rawSource: rawJsonNumberSource(item, "commission") }));
       assertMinorRange(unitPriceMinor, "INVALID_ORDER_ITEM_UNIT_PRICE", `Order item ${orderItemId} unitPrice`);
       assertMinorRange(totalPriceMinor, "INVALID_ORDER_ITEM_TOTAL_PRICE", `Order item ${orderItemId} totalPrice`);
       if (commissionMinor !== null) assertMinorRange(commissionMinor, "INVALID_ORDER_ITEM_COMMISSION", `Order item ${orderItemId} commission`);
@@ -1029,7 +1182,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const priceEntry = bundlePrices.find(price => price.quantity === 1) ?? bundlePrices[0];
     const catalogUnitPrice = priceEntry?.unitPrice === null || priceEntry?.unitPrice === undefined
       ? null
-      : strictJsonDecimal(priceEntry.unitPrice, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`, { allowNegative: false });
+      : strictJsonDecimal(priceEntry.unitPrice, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(priceEntry, "unitPrice") });
     const catalogUnitPriceMinor = catalogUnitPrice ? moneyToMinor(catalogUnitPrice) : null;
     if (catalogUnitPriceMinor !== null) assertMinorRange(catalogUnitPriceMinor, "INVALID_CATALOG_UNIT_PRICE", `Catalog offer ${offerId} unitPrice`);
     const fulfilment = record(offer.fulfilment);
@@ -1077,13 +1230,13 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const ean = text(commission.ean);
     const result = record(commission.result);
     if (!/^\d{13}$/.test(ean) || integer(commission.status) !== 200) continue;
-    const estimateUnitPrice = strictJsonDecimal(commission.unitPrice, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`, { allowNegative: false });
+    const estimateUnitPrice = strictJsonDecimal(commission.unitPrice, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`, { allowNegative: false, rawSource: rawJsonNumberSource(commission, "unitPrice") });
     const estimateUnitPriceMinor = moneyToMinor(estimateUnitPrice);
     assertMinorRange(estimateUnitPriceMinor, "INVALID_COMMISSION_ESTIMATE_UNIT_PRICE", `Commission estimate ${ean} unitPrice`);
-    const fixedAmount = databaseDecimal(result.fixedAmount, "INVALID_COMMISSION_FIXED_AMOUNT", `Commission estimate ${ean} fixedAmount`, { allowNegative: false });
-    const percentage = databaseDecimal(result.percentage, "INVALID_COMMISSION_PERCENTAGE", `Commission estimate ${ean} percentage`, { allowNegative: false, scaleDigits: 6, minScaled: 0n, maxScaled: 100_000_000n });
-    const totalCost = databaseDecimal(result.totalCost, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCost`, { allowNegative: false });
-    const totalCostWithoutReduction = databaseDecimal(result.totalCostWithoutReduction, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCostWithoutReduction`, { allowNegative: false });
+    const fixedAmount = databaseDecimal(result.fixedAmount, "INVALID_COMMISSION_FIXED_AMOUNT", `Commission estimate ${ean} fixedAmount`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "fixedAmount") });
+    const percentage = databaseDecimal(result.percentage, "INVALID_COMMISSION_PERCENTAGE", `Commission estimate ${ean} percentage`, { allowNegative: false, scaleDigits: 6, minScaled: 0n, maxScaled: 100_000_000n, rawSource: rawJsonNumberSource(result, "percentage") });
+    const totalCost = databaseDecimal(result.totalCost, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCost`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "totalCost") });
+    const totalCostWithoutReduction = databaseDecimal(result.totalCostWithoutReduction, "INVALID_COMMISSION_TOTAL_COST", `Commission estimate ${ean} totalCostWithoutReduction`, { allowNegative: false, rawSource: rawJsonNumberSource(result, "totalCostWithoutReduction") });
     const fields = {
       ean,
       observed_at: generatedAt,
@@ -1249,7 +1402,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     }
   }
 
-  const invoices = rows(settlement.invoices);
+  const invoices = contractRows(settlement.invoices, "INVALID_INVOICE_HEADERS", "settlement.invoices");
   const seenInvoiceIds = new Set<string>();
   for (let invoiceIndex = 0; invoiceIndex < invoices.length; invoiceIndex += 1) {
     const invoice = invoices[invoiceIndex];
@@ -1263,20 +1416,20 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       totals.payableAmount,
       "INVALID_INVOICE_PAYABLE_AMOUNT",
       `Invoice ${invoiceId} payableAmount`,
-      { required: true, scaleDigits: 2 },
+      { required: true, scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "payableAmount") },
     );
     assertContract(payable, "INVALID_INVOICE_PAYABLE_AMOUNT", `Invoice ${invoiceId} payableAmount is required.`);
     const taxExclusive = databaseDecimal(
       totals.taxExclusiveAmount,
       "INVALID_INVOICE_TAX_EXCLUSIVE_AMOUNT",
       `Invoice ${invoiceId} taxExclusiveAmount`,
-      { scaleDigits: 2 },
+      { scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "taxExclusiveAmount") },
     );
     const taxInclusive = databaseDecimal(
       totals.taxInclusiveAmount,
       "INVALID_INVOICE_TAX_INCLUSIVE_AMOUNT",
       `Invoice ${invoiceId} taxInclusiveAmount`,
-      { scaleDigits: 2 },
+      { scaleDigits: 2, rawSource: rawJsonNumberSource(totals, "taxInclusiveAmount") },
     );
     const fields = {
       invoice_id: invoiceId,
@@ -1293,12 +1446,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     facts.invoice_headers.push(await fact(fields, invoiceId, "financial", `/settlement/invoices/${invoiceIndex}`, fields.issue_date || generatedAt, now));
   }
 
-  const specifications = rows(settlement.invoiceSpecifications);
+  const specifications = contractRows(settlement.invoiceSpecifications, "INVALID_INVOICE_SPECIFICATIONS", "settlement.invoiceSpecifications");
   for (let specificationIndex = 0; specificationIndex < specifications.length; specificationIndex += 1) {
     const specification = specifications[specificationIndex];
     const invoiceId = text(specification.invoiceId);
     assertContract(invoiceId, "INVALID_INVOICE_SPECIFICATION", `Invoice specification ${specificationIndex} has no invoice ID.`);
-    const lines = rows(specification.lines);
+    const lines = contractRows(specification.lines, "INVALID_INVOICE_SPECIFICATION_LINES", `Invoice ${invoiceId} specification lines`);
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
       const parsed = invoiceLineFields(lines[lineIndex], invoiceId, lineIndex);
       assertContract(parsed.invoice_line_ref, "INVALID_INVOICE_TRANSACTION", `Invoice ${invoiceId} contains a transaction without a line reference.`);
