@@ -119,6 +119,10 @@ function integer(value: unknown, fallback = 0): number {
   return result === null ? fallback : Math.trunc(result);
 }
 
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
 function round(value: number, decimals = 2) {
   const factor = 10 ** decimals;
   return Math.round((value + Number.EPSILON) * factor) / factor;
@@ -618,7 +622,13 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const fulfilment = record(item.fulfilment);
       const orderItemId = text(item.orderItemId);
       const ean = text(product.ean ?? item.ean);
-      const quantityShipped = integer(item.quantityShipped ?? item.quantity);
+      const rawQuantityShipped = item.quantityShipped;
+      assertContract(
+        positiveSafeInteger(rawQuantityShipped),
+        "INVALID_SHIPMENT_QUANTITY",
+        `Shipment ${shipmentId} item ${itemIndex} quantity must be a positive safe integer JSON number.`,
+      );
+      const quantityShipped = rawQuantityShipped;
       const unitPrice = numberValue(item.unitPrice);
       const commission = numberValue(item.commission);
       const lineGrossMinor = unitPrice === null ? null : lineGrossToMinor(unitPrice, quantityShipped);
@@ -750,8 +760,14 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const rmaId = text(item.rmaId);
       const ean = text(item.ean);
       const orderId = nullableText(item.orderId);
-      const expectedQuantity = integer(item.expectedQuantity);
-      assertContract(rmaId && /^\d{13}$/.test(ean) && Number.isSafeInteger(expectedQuantity) && expectedQuantity > 0, "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
+      const rawExpectedQuantity = item.expectedQuantity;
+      assertContract(
+        positiveSafeInteger(rawExpectedQuantity),
+        "INVALID_RETURN_QUANTITY",
+        `Return ${returnId} item ${itemIndex} expectedQuantity must be a positive safe integer JSON number.`,
+      );
+      const expectedQuantity = rawExpectedQuantity;
+      assertContract(rmaId && /^\d{13}$/.test(ean), "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
       commercialEans.add(ean);
       assertContract(!seenRmas.has(rmaId), "DUPLICATE_RETURN_ITEM", `Return RMA ${rmaId} occurs more than once in the source.`);
       seenRmas.add(rmaId);
@@ -820,9 +836,14 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const candidate = group.candidate;
     const ean = text(candidate.ean);
     const metric = metricFor(ean);
-    const shipmentQuantity = integer(candidate.quantity_shipped);
+    const shipmentQuantity = candidate.quantity_shipped as number;
     const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
     const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
+    assertContract(
+      positiveSafeInteger(aggregateReturnQuantity),
+      "INVALID_RETURN_QUANTITY",
+      `Shipment item ${allocationKey} aggregate return quantity exceeds the safe integer range.`,
+    );
     const lineGrossMinor = candidate._line_gross_minor as bigint;
     const commissionMinor = candidate._commission_minor as bigint;
 

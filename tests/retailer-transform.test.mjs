@@ -500,6 +500,35 @@ test('shipments outside the claimed Monday-Sunday period fail closed', async () 
   );
 });
 
+test('shipment quantity rejects every non-number or non-positive-safe-integer raw value', async () => {
+  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
+  for (const invalidQuantity of invalidQuantities) {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    loaded.artifacts.commercial.operational.shipmentDetails[0]
+      .detail.shipmentItems[0].quantityShipped = invalidQuantity;
+    let publication;
+    await assert.rejects(
+      async () => { publication = await context.buildPublication(claim, loaded); },
+      error => error.code === 'INVALID_SHIPMENT_QUANTITY',
+    );
+    assert.equal(publication, undefined);
+  }
+});
+
+test('shipment quantity accepts a positive safe integer JSON number without coercion', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  loaded.artifacts.commercial.operational.shipmentDetails[0]
+    .detail.shipmentItems[0].quantityShipped = 2;
+  const publication = await context.buildPublication(claim, loaded);
+  const fact = publication.facts.outbound_shipment_items
+    .find(row => row.shipment_id === 'shipment-1');
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '6970452112658');
+  assert.equal(fact.quantity_shipped, 2);
+  assert.equal(metric.gross_shipped_units, 2);
+});
+
 test('returns outside the claimed Monday-Sunday period fail closed', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
@@ -508,6 +537,36 @@ test('returns outside the claimed Monday-Sunday period fail closed', async () =>
     context.buildPublication(claim, loaded),
     error => error.code === 'OUT_OF_PERIOD_RETURN',
   );
+});
+
+test('return quantity rejects every non-number or non-positive-safe-integer raw value', async () => {
+  const invalidQuantities = [undefined, null, true, 1.9, '1.9', '2', '1e3', ' 2 ', 0, -1, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity];
+  for (const invalidQuantity of invalidQuantities) {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    loaded.artifacts.commercial.operational.returns[0]
+      .returnItems[0].expectedQuantity = invalidQuantity;
+    let publication;
+    await assert.rejects(
+      async () => { publication = await context.buildPublication(claim, loaded); },
+      error => error.code === 'INVALID_RETURN_QUANTITY',
+    );
+    assert.equal(publication, undefined);
+  }
+});
+
+test('return quantity accepts a positive safe integer JSON number without coercion', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const linkedReturn = loaded.artifacts.commercial.operational.returns
+    .flatMap(row => row.returnItems)
+    .find(item => item.ean === '8720892887504');
+  linkedReturn.expectedQuantity = 2;
+  const publication = await context.buildPublication(claim, loaded);
+  const fact = publication.facts.return_items.find(row => row.rma_id === linkedReturn.rmaId);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === linkedReturn.ean);
+  assert.equal(fact.expected_quantity, 2);
+  assert.equal(metric.linked_return_units, 2);
 });
 
 test('a return without an order ID cannot receive a financial value match', async () => {

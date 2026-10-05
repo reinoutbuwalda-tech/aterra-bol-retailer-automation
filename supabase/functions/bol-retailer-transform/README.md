@@ -25,7 +25,7 @@ The function uses a custom `x-aterra-cron-token` check, so Supabase gateway JWT 
 - Every valid catalog offer receives a weekly row, even when activity is zero.
 - An incomplete catalog blocks catalog-dependent products rather than shrinking the
   product universe and accidentally passing coverage.
-- Sales come from outbound shipment items.
+- Sales come from outbound shipment items. `quantityShipped` and return `expectedQuantity` must be positive safe integer JSON numbers; integer/fractional/exponent-form strings, signed or whitespace-padded strings, zero, negatives, nonfinite values, and unsafe integers are rejected before conversion or fact creation.
 - Returns remain registered events. All RMAs that map to one unique shipment item are evaluated as one deterministic group. When aggregate return quantity exceeds shipped quantity, the whole group remains financially unallocated with an explicit exception; otherwise valuation uses the exact shipment-line gross and commission totals, proportionally for partial returns.
 - Shipment-line gross and commission use exact integer minor units. Grouped partial returns use deterministic half-up allocation; full returns reverse the exact line totals, and negative provisional revenue after commission remains negative rather than being clamped.
 - Malformed insight rows and any insight date outside the claimed week fail closed. Date-only insight and rank fields must be canonical calendar-valid `YYYY-MM-DD` values; timestamp suffixes are not truncated.

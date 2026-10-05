@@ -86,10 +86,10 @@ table access; the service role performs controlled pipeline writes.
 
 | Metric | Plain-English rule |
 | --- | --- |
-| Gross shipped units | Quantity in outbound shipment lines dated in the week. |
+| Gross shipped units | Positive safe integer `quantityShipped` JSON numbers in outbound shipment lines dated in the week; coercible strings and fractional values are rejected. |
 | Gross shipped GMS | Shipped quantity multiplied by shipment-line unit price. |
 | Gross commission | Sum of the commission amount already reported for each shipment line. |
-| Registered returns | Return events registered in the week. |
+| Registered returns | Return events registered in the week whose `expectedQuantity` is a positive safe integer JSON number; strings and fractional values are rejected. |
 | Linked returns | All RMAs matched by exact order ID and EAN to one unique weekly shipment item, but only when aggregate group quantity does not exceed shipped quantity. Conflicting groups remain wholly unallocated. |
 | Linked return GMS | Exact shipment-line gross allocated by the accepted group quantity ratio, so a full return reverses the original gross exactly and overflow remains an explicit exception. |
 | Provisional net GMS | Gross shipped GMS minus linked return GMS. |
