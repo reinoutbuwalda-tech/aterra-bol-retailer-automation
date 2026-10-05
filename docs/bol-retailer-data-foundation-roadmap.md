@@ -86,6 +86,17 @@ The repo has focused tests for:
 - SQL foundation structure;
 - rendered application checks.
 
+The clean-checkout validation is not yet complete. The transform regression suite
+expects `docs/bol-retailer-api-2026-W39-snapshot-2026-09-28.json`, but that sanitized
+fixture is not versioned in this repository. The extraction and SQL foundation tests
+run independently; the transform suite must become self-contained before it can be a
+required CI check.
+
+The operating notes dated 29 September 2026 report that extraction, Drive backup, and
+transformation were active and that W36-W39 were backfilled. These are historical
+operating records, not a current production-health check. No production job, live
+migration, or deployment was executed while preparing this roadmap.
+
 Useful commands include:
 
 ```bash
@@ -127,12 +138,23 @@ Work:
 - Document which GitHub repo is authoritative for Retailer foundation work.
 - Keep generated reports, large evidence files, local outputs, and temporary artifacts out of source control unless explicitly needed as fixtures.
 - Add a small PR checklist for data-foundation changes: no production job, no live migration, test command, secret scan, docs update.
+- Add a small sanitized W39 fixture, or generated equivalent, so all focused tests run
+  from a clean checkout.
+- Add required GitHub Actions checks for Retailer tests, migration and SQL validation,
+  Markdown links, generated artifacts, and secret scanning.
+- Separate Retailer validation commands from the inherited application build so this
+  backend can be checked without unrelated UI state.
+- Write one reproducible environment, deployment, rollback, and secret-rotation runbook
+  for Supabase, Vercel, Vault, Google OAuth, and Drive.
 
 Exit criteria:
 
 - A new engineer can understand the current pipeline without reading every migration.
 - The README points to the foundation docs and roadmap.
 - Documentation-only PRs are easy to distinguish from production-affecting PRs.
+- A clean clone passes all required checks without files from another local checkout.
+- A second engineer can explain the deployment and rollback sequence without relying on
+  chat history.
 
 ### Phase 2: Finish operational monitoring
 
@@ -147,12 +169,16 @@ Work:
 - Add clear operator messages for common states: missing visits, unmatched returns, checksum mismatch, stale run, failed Drive backup, retry exhausted.
 - Decide whether notification should happen through email, Slack, dashboard alerts, or a combination.
 - Add a weekly monitor that reports only when action is needed.
+- Add an independent watchdog for missed schedules and stale leases; recovery must not
+  depend on the next normal invocation.
+- Define a Monday service window, alert acknowledgement owner, and recovery target.
 
 Exit criteria:
 
 - Reinout can see the latest weekly state without querying SQL.
 - A failed or partial week has one obvious next action.
 - Silent failure is no longer possible for extraction, Drive backup, or transform.
+- Missed schedules and stale runs are detected within the agreed service window.
 
 ### Phase 3: Harden reruns, backfills, and recovery
 
@@ -167,12 +193,18 @@ Work:
 - Add tests for preserving an accounting-approved report against automated replacement.
 - Add a historical backfill checklist for weeks older than the current API window.
 - Document which historical gaps cannot be repaired because Bol no longer exposes the data.
+- Split extraction into resumable checkpoints by dataset and pagination cursor so API
+  throttling or an Edge Function timeout does not restart the complete weekly pull.
+- Persist enough rate-limit and continuation state to avoid repeating completed pages.
+- Test year boundaries, daylight-saving changes, prolonged `429` responses, pagination
+  limits, and interrupted continuations.
 
 Exit criteria:
 
 - A rerun cannot accidentally erase better evidence.
 - An operator can backfill or retry a week with a written checklist.
 - Historical limitations are explicit instead of hidden in code.
+- An interrupted extraction resumes without duplicate artifacts or facts.
 
 ### Phase 4: Connect the foundation to the application
 
@@ -205,12 +237,16 @@ Work:
 - Add reconciliation checks between provisional weekly metrics and invoice/settlement evidence.
 - Add review states for accountant approval, rejection, and requested correction.
 - Preserve policy version and approval evidence with each accounting-ready output.
+- Validate at least four closed weeks, including one with returns and one that crosses a
+  settlement or accounting-period boundary.
 
 Exit criteria:
 
 - Operators can use weekly trading reports quickly.
 - Accountants can separately review settlement-backed figures.
 - The system never labels provisional operational metrics as closed accounting.
+- Four closed weeks reconcile within an accountant-approved tolerance and retain review
+  evidence.
 
 ### Phase 6: Expand product, inventory, and traffic coverage
 
@@ -262,6 +298,9 @@ Work:
 - Add a quarterly source-contract review.
 - Keep metric definitions current when business rules change.
 - Add backup/restore checks for critical Storage objects and reporting tables.
+- Test a restore and each managed-secret rotation with a second operator.
+- Add cost and capacity monitoring for Edge Functions, Storage, database growth, Drive,
+  and Retailer API calls.
 - Decide which tasks belong in GitHub issues, Notion, Slack, or the dashboard.
 - Add ownership notes for who approves operational changes, accounting changes, and source-contract changes.
 
@@ -270,6 +309,7 @@ Exit criteria:
 - The foundation can be operated without relying on memory from one chat thread.
 - New data problems become tracked work, not hidden manual fixes.
 - There is a clear owner for every production-affecting change.
+- Restore and credential rotation no longer depend on the original implementer.
 
 ## Work backlog
 
@@ -282,6 +322,10 @@ Exit criteria:
 
 ### Engineering
 
+- Add a self-contained sanitized fixture for the transform regression suite.
+- Add required CI for tests, migrations, links, generated files, and secret scanning.
+- Refactor the extractor into resumable, checkpointed work units.
+- Add an independent stale-run and missed-schedule watchdog.
 - Add an app read model for latest Retailer pipeline health.
 - Add tests for lower-readiness reruns and accounting-approved report protection.
 - Add tests for zero-activity rows across every active mapped product.
@@ -291,6 +335,8 @@ Exit criteria:
 
 ### Operations
 
+- Name the operational owner and technical owner for the Retailer service.
+- Record deployed function hashes and migration state against the repository.
 - Decide notification channel for failed or partial weekly runs.
 - Decide who reviews weekly exceptions.
 - Decide how long source artifacts and Drive backups must be retained.
@@ -309,7 +355,11 @@ Exit criteria:
 The Retailer data foundation is fully complete when all of the following are true:
 
 - Weekly extraction, Drive backup, transform, and report publication run cloud-side without laptop dependency.
+- Four consecutive Monday runs finish within the agreed service window without manual
+  data repair.
 - Every weekly run has a terminal state and cannot remain silently stuck.
+- Interrupted extraction resumes from a durable checkpoint without duplicating source
+  artifacts or normalized facts.
 - Every source artifact has stored byte size and SHA-256 verification.
 - Every published metric has a source pointer and calculation rule.
 - Every active product appears in weekly product metrics, even with zero activity.
@@ -319,12 +369,18 @@ The Retailer data foundation is fully complete when all of the following are tru
 - Accountants can distinguish operational trading metrics from settlement-backed accounting numbers.
 - Secrets are stored only in managed secret stores, never in source, logs, artifacts, or PRs.
 - The README, architecture doc, operations runbook, and roadmap are all current.
+- CI passes in a clean clone and blocks incompatible migrations, broken documentation
+  links, generated evidence, and detected secrets.
+- Deployment, rollback, restore, and secret rotation have each been exercised by someone
+  other than the original implementer.
 
 ## Main risks
 
 - Bol API windows may not allow old traffic or ranking data to be recovered later.
 - Source response shapes can change without warning.
 - A single long Edge Function invocation may eventually hit duration or rate-limit constraints.
+- The current transform test depends on a non-versioned local W39 fixture, so test success
+  can differ between machines.
 - Drive and Google credential handling adds a second cloud dependency.
 - Unmatched returns can distort operational interpretation if not reviewed.
 - Product mapping mistakes can make a valid source fact appear under the wrong product.
@@ -338,6 +394,8 @@ The Retailer data foundation is fully complete when all of the following are tru
 - Which GitHub repo is the long-term source of truth for the combined financial system?
 - Should the Retailer foundation stay in its own repo or merge into the broader financial control room repo?
 - What is the official notification channel for weekly failures?
+- Who is the operational owner, who is the technical owner, and what Monday service and
+  recovery targets do they accept?
 - Who approves a lower-readiness rerun becoming active?
 - What exact status allows dashboard publication?
 - What exact status allows accounting use?
@@ -351,7 +409,8 @@ Make repository ownership explicit before adding more production behavior.
 Recommended next step:
 
 1. Decide which GitHub repo is authoritative for the Retailer data foundation.
-2. Add the operator checklist for inspecting the latest ISO week.
-3. Add the latest-pipeline-health read model and dashboard/API surface.
-4. Add rerun and approved-report protection tests.
-5. Only after those are in place, connect the reporting views to the app dashboard.
+2. Name the operational and technical owners.
+3. Compare deployed Supabase and Vercel state with the repository using read-only checks.
+4. Make the transform fixture self-contained and add required CI.
+5. Add the independent watchdog and operator checklist.
+6. Only after those controls are in place, connect reporting views to the app dashboard.
