@@ -29,7 +29,9 @@ export async function POST(request: Request) {
   try {
     const encryptedRefreshToken = typeof body.encryptedRefreshToken === "string" ? body.encryptedRefreshToken : "";
     if (!encryptedRefreshToken) return NextResponse.json({ status: "invalid_request", reason: "Missing encrypted Google refresh token." }, { status: 400 });
-    const { encryptedRefreshToken: _secret, ...workerBody } = body;
+    const workerBody = Object.fromEntries(
+      Object.entries(body).filter(([key]) => key !== "encryptedRefreshToken"),
+    );
     const googleTokens = await refreshGoogleAccessToken(encryptedRefreshToken);
     const response = await fetch(BACKUP_URL, {
       method: "POST",

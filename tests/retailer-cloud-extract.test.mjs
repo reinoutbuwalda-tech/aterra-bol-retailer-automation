@@ -16,7 +16,7 @@ function collector(responses = []) {
       return new Response(JSON.stringify(response.body), { status: response.status ?? 200 });
     },
   });
-  vm.runInContext(stripTypeScriptTypes(source.replace(/^import .*\n/, '')), context);
+  vm.runInContext(stripTypeScriptTypes(source.replace(/^import[^\r\n]*(?:\r?\n)/, '')), context);
   return context;
 }
 function state(maxPages = 2) {

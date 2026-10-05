@@ -164,7 +164,7 @@ function transformer() {
     crypto: globalThis.crypto,
     Deno: { serve() {}, env: { get() { return 'test'; } } },
   });
-  vm.runInContext(stripTypeScriptTypes(source.replace(/^import .*\n/, '')), context);
+  vm.runInContext(stripTypeScriptTypes(source.replace(/^import[^\r\n]*(?:\r?\n)/, '')), context);
   return context;
 }
 
@@ -528,7 +528,52 @@ test('a return quantity larger than its exact shipment match remains unlinked', 
   const metric = publication.weeklyReport.metrics.find(row => row.ean === linkedReturn.ean);
   assert.equal(metric.linked_return_units, 0);
   assert.equal(metric.unlinked_return_units, 99);
-  assert.equal(publication.exceptions.some(row => row.exception_code === 'RETURN_QUANTITY_EXCEEDS_SHIPMENT'), true);
+  assert.equal(publication.exceptions.some(row => row.exception_code === 'RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT'), true);
+});
+
+test('distinct returns can cumulatively allocate exactly the shipped quantity', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const returnCase = loaded.artifacts.commercial.operational.returns
+    .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
+  returnCase.returnItems.push({
+    rmaId: 'rma-linked-carafe-second',
+    orderId: 'order-2',
+    ean: '8720892887504',
+    expectedQuantity: 3,
+    handled: false,
+    returnReason: { mainReason: 'Quality' },
+  });
+
+  const publication = await context.buildPublication(claim, loaded);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
+  assert.equal(metric.linked_return_units, 4);
+  assert.equal(metric.unlinked_return_units, 0);
+  assert.equal(metric.linked_return_gms, metric.gross_shipped_gms);
+});
+
+test('cumulative return overflow remains wholly unallocated with explicit evidence', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const returnCase = loaded.artifacts.commercial.operational.returns
+    .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
+  returnCase.returnItems.push({
+    rmaId: 'rma-overflow-carafe-second',
+    orderId: 'order-2',
+    ean: '8720892887504',
+    expectedQuantity: 4,
+    handled: false,
+    returnReason: { mainReason: 'Quality' },
+  });
+
+  const publication = await context.buildPublication(claim, loaded);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
+  const overflow = publication.exceptions.find(row => row.business_key === 'rma-overflow-carafe-second');
+  assert.equal(metric.linked_return_units, 1);
+  assert.equal(metric.unlinked_return_units, 4);
+  assert.equal(overflow.exception_code, 'RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT');
+  assert.equal(overflow.evidence.alreadyAllocatedReturnQuantity, 1);
+  assert.equal(overflow.evidence.remainingShipmentQuantity, 3);
 });
 
 test('duplicate shipment details fail before weekly metrics can double count', async () => {
@@ -551,6 +596,59 @@ test('duplicate return RMAs fail before return metrics can double count', async 
   await assert.rejects(
     context.buildPublication(claim, loaded),
     error => error.code === 'DUPLICATE_RETURN_ITEM',
+  );
+});
+
+test('seven valid insight dates plus an out-of-week date fail closed', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
+  visits.periods.push({
+    period: { year: 2026, month: 9, day: 28 },
+    total: 1,
+    countries: [{ countryCode: 'NL', value: 1 }],
+  });
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'OUT_OF_PERIOD_INSIGHT',
+  );
+});
+
+test('a malformed insight row cannot hide beside valid weekly coverage', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  loaded.artifacts.insights.weekMetrics.offerInsights.push({
+    ean: 'invalid-ean',
+    offerId: 'offer-invalid',
+    metric: 'PRODUCT_VISITS',
+    periods: [],
+  });
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INVALID_INSIGHT_EAN',
+  );
+});
+
+test('an unsupported insight metric cannot hide beside valid weekly coverage', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const malformed = structuredClone(loaded.artifacts.insights.weekMetrics.offerInsights[0]);
+  malformed.metric = 'UNKNOWN_METRIC';
+  loaded.artifacts.insights.weekMetrics.offerInsights.push(malformed);
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INVALID_INSIGHT_METRIC',
+  );
+});
+
+test('an invalid insight period date fails closed', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
+  visits.periods[0].period = {};
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INVALID_INSIGHT_DATE',
   );
 });
 

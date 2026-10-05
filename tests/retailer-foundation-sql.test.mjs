@@ -61,7 +61,7 @@ test('artifact integrity is independent from intentional parsing scope', () => {
 });
 
 test('every published weekly measure has interpretation metadata', () => {
-  const metricCodes = [...metricDictionary.matchAll(/^\s{2}\(\n\s{4}'([a-z_]+)',/gm)].map(match => match[1]);
+  const metricCodes = [...metricDictionary.matchAll(/^\s{2}\(\r?\n\s{4}'([a-z_]+)',/gm)].map(match => match[1]);
   const expected = [
     'gross_shipped_units',
     'gross_shipped_gms',

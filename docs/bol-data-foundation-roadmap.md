@@ -63,7 +63,7 @@ What is already in place:
 - The historical W36-W39 Retailer foundation has been backfilled and documented.
 - The current PR branch contains `retailer-transform-v2`, which strengthens the source
   contract and publication rules.
-- The focused test suite currently has 56 passing tests for the Retailer transform and
+- The focused test suite currently has 62 passing tests for the Retailer transform and
   report-generator behavior.
 
 Known current limitations:

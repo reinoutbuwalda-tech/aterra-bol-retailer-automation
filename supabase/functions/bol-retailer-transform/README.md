@@ -26,10 +26,11 @@ The function uses a custom `x-aterra-cron-token` check, so Supabase gateway JWT 
 - An incomplete catalog blocks catalog-dependent products rather than shrinking the
   product universe and accidentally passing coverage.
 - Sales come from outbound shipment items.
-- Returns remain registered events and reduce provisional value only after an exact order-ID and EAN match.
+- Returns remain registered events and reduce provisional value only after an exact order-ID and EAN match; cumulative allocations cannot exceed the uniquely matched shipment item.
 - Gross ASP is calculated before returns.
+- Malformed insight rows and any insight date outside the claimed week fail closed.
 - Buy Box percentages retain country and date and are never summed into a fabricated total.
-- Weekly visits require seven aligned dates for every EAN in the weekly report,
+- Weekly visits require the exact seven claimed dates for every EAN in the weekly report,
   including sold or returned products absent from the current offer list. Partial
   daily evidence does not become a weekly metric.
 - Same-week units divided by visits is labeled as a trading proxy, not cohort conversion.

@@ -125,9 +125,26 @@ message can never be interpreted by the wrong transform semantics:
    and source-artifact integrity before treating the rollout as complete.
 
 The v2 worker rejects a v1 claim rather than silently applying new rules under an old
-lineage label. Rollback before step 3 is simply redeploying v11. After step 3, rollback
-requires restoring the v1 enqueue function before redeploying v11; already published v2
-revisions remain immutable audit evidence.
+lineage label. Rollback before step 3 is simply redeploying v1. After step 3, use this
+order; do not put a v1 worker in front of queued v2 messages:
+
+1. Freeze the extraction, transform-worker, and retry schedules so no new source run or
+   queue message can appear during rollback.
+2. Keep the v2 worker deployed while existing v2 work drains. Verify every v2 transform
+   run is `published` or `rejected`, and verify `pgmq.metrics('bol_retailer_transform')`
+   reports a zero queue length.
+3. Restore the v1 `pipeline.enqueue_bol_retailer_transform()` definition while schedules
+   remain frozen, then deploy the v1 worker.
+4. Re-enable schedules only after confirming the queue is still empty and a controlled
+   v1 test source creates a v1 transform run and message.
+
+For an emergency where v2 cannot drain, keep all schedules frozen and capture the
+stranded run IDs, message IDs, attempt state, and error details. In one reviewed database
+transaction, archive only the identified v2 queue messages and mark their nonterminal
+transform runs `rejected` with a `ROLLBACK_DISPOSITION` error code and corresponding
+attempt evidence before restoring v1. Do not delete published revisions or bulk-clear
+the queue. If the message-to-run mapping cannot be proven, stop the rollback and restore the v2 worker instead. Already published
+v2 revisions remain immutable audit evidence.
 
 Both weekly reports and individual data products keep the strongest usable revision for
 the week. A later `ready_with_limits` data product cannot displace an existing `ready`
@@ -159,6 +176,13 @@ shipments, returns, or visits. This prevents a zero-sales product from disappear
 traffic totals or trend analysis.
 
 ## Verification
+
+The behavioral v2 migration harness runs with `npm run test:migration`. Local execution
+requires a disposable PostgreSQL 16 database named `retailer_migration_ci`, the `psql`
+client, and `RETAILER_MIGRATION_DATABASE_URL`; it refuses every other database name and
+creates and drops only its dedicated test schemas and tables. Without that variable the three database cases report an explicit
+skip. Pull-request CI provisions PostgreSQL 16 and must pass cutover, revision-
+promotion, guard rollback, and forced-backfill rollback cases before release.
 
 `node --test tests/retailer-cloud-extract.test.mjs` runs the collector regression cases.
 The 19 September cloud validation made 221 API calls with zero final API errors,

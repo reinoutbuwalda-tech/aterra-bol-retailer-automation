@@ -479,6 +479,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const exceptions: JsonRecord[] = [];
 
   const shipmentCandidates = new Map<string, JsonRecord[]>();
+  const allocatedReturnUnitsByShipmentItem = new Map<string, number>();
   const productMetrics = new Map<string, {
     grossUnits: number;
     grossGms: number;
@@ -671,35 +672,40 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const metric = metricFor(ean);
       metric.registeredReturns += expectedQuantity;
       const candidates = orderId ? shipmentCandidates.get(`${orderId}|${ean}`) || [] : [];
-      if (orderId && candidates.length === 1 && expectedQuantity <= integer(candidates[0].quantity_shipped)) {
-        const candidate = candidates[0];
-        const perUnitCommission = (numberValue(candidate.commission) || 0) / integer(candidate.quantity_shipped, 1);
+      const candidate = candidates.length === 1 ? candidates[0] : null;
+      const allocationKey = candidate ? `${text(candidate.shipment_id)}|${text(candidate.order_item_id)}` : null;
+      const shipmentQuantity = candidate ? integer(candidate.quantity_shipped) : 0;
+      const alreadyAllocatedQuantity = allocationKey ? allocatedReturnUnitsByShipmentItem.get(allocationKey) || 0 : 0;
+      const remainingShipmentQuantity = Math.max(0, shipmentQuantity - alreadyAllocatedQuantity);
+      if (orderId && candidate && allocationKey && expectedQuantity <= remainingShipmentQuantity) {
+        const perUnitCommission = (numberValue(candidate.commission) || 0) / Math.max(1, shipmentQuantity);
+        allocatedReturnUnitsByShipmentItem.set(allocationKey, alreadyAllocatedQuantity + expectedQuantity);
         metric.linkedReturns += expectedQuantity;
         metric.linkedReturnGms += expectedQuantity * (numberValue(candidate.unit_price) || 0);
         metric.linkedReturnCommission += expectedQuantity * perUnitCommission;
       } else {
         metric.unlinkedReturns += expectedQuantity;
         const missingOrderId = !orderId;
-        const quantityExceedsShipment = candidates.length === 1 && expectedQuantity > integer(candidates[0].quantity_shipped);
+        const quantityExceedsShipment = Boolean(candidate) && expectedQuantity > remainingShipmentQuantity;
         const ambiguous = candidates.length > 1;
         const exceptionCode = missingOrderId
           ? "RETURN_MISSING_ORDER_ID"
           : quantityExceedsShipment
-          ? "RETURN_QUANTITY_EXCEEDS_SHIPMENT"
+          ? "RETURN_QUANTITY_EXCEEDS_AVAILABLE_SHIPMENT"
           : ambiguous
           ? "AMBIGUOUS_RETURN_MATCH"
           : "UNMATCHED_RETURN";
         const exceptionTitle = missingOrderId
           ? "Return has no order ID"
           : quantityExceedsShipment
-          ? "Return quantity exceeds the matched weekly shipment"
+          ? "Return quantity exceeds the remaining matched shipment quantity"
           : ambiguous
           ? "Return has several possible shipment matches"
           : "Return has no shipment match in this week";
         const limitation = missingOrderId
           ? "Return could not be linked because its order ID is missing."
           : quantityExceedsShipment
-          ? "Return could not be linked because its quantity exceeds the matched weekly shipment."
+          ? "Return was not financially allocated because its full quantity exceeds the remaining matched shipment quantity."
           : ambiguous
           ? "Return could not be linked because several shipment lines matched."
           : "Return could not be linked to a shipment in this reporting week.";
@@ -719,7 +725,9 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
               orderId,
               expectedQuantity,
               candidateCount: candidates.length,
-              matchedShipmentQuantity: candidates.length === 1 ? integer(candidates[0].quantity_shipped) : null,
+              matchedShipmentQuantity: candidate ? shipmentQuantity : null,
+              alreadyAllocatedReturnQuantity: candidate ? alreadyAllocatedQuantity : null,
+              remainingShipmentQuantity: candidate ? remainingShipmentQuantity : null,
             },
           },
         ));
@@ -815,22 +823,47 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     facts.commission_estimates.push(await fact(fields, `${ean}|${generatedAt}|${fields.unit_price}`, "catalog", `/currentState/commissions/${commissionIndex}`, generatedAt, now));
   }
 
-  const insightRows = rows(weekMetrics.offerInsights);
+  const insightRowsValue = weekMetrics.offerInsights;
+  assertContract(
+    Array.isArray(insightRowsValue) && insightRowsValue.every(isRecord),
+    "INVALID_INSIGHT_ROWS",
+    "insights.json offerInsights must be an array of objects.",
+  );
+  const insightRows = insightRowsValue as JsonRecord[];
+  const expectedInsightDates = new Set(
+    Array.from({ length: 7 }, (_, index) => addUtcDays(claim.periodStart, index) as string),
+  );
+  const hasExactWeek = (dates: Set<string> | undefined) =>
+    dates?.size === expectedInsightDates.size && [...expectedInsightDates].every(date => dates.has(date));
   const visitDatesByEan = new Map<string, Set<string>>();
   const buyBoxDatesByEan = new Map<string, Set<string>>();
   const seenVisitTotals = new Set<string>();
+  const seenBuyBoxDates = new Set<string>();
   const seenInsightCountries = new Set<string>();
   for (let insightIndex = 0; insightIndex < insightRows.length; insightIndex += 1) {
     const insight = insightRows[insightIndex];
     const ean = text(insight.ean);
     const offerId = text(insight.offerId);
     const metricName = text(insight.metric);
-    if (!/^\d{13}$/.test(ean) || !offerId || !["PRODUCT_VISITS", "BUY_BOX_PERCENTAGE"].includes(metricName)) continue;
-    const periods = rows(insight.periods);
+    assertContract(/^\d{13}$/.test(ean), "INVALID_INSIGHT_EAN", `Insight row ${insightIndex} has an invalid EAN.`);
+    assertContract(Boolean(offerId), "INVALID_INSIGHT_OFFER_ID", `Insight row ${insightIndex} has no offer ID.`);
+    assertContract(["PRODUCT_VISITS", "BUY_BOX_PERCENTAGE"].includes(metricName), "INVALID_INSIGHT_METRIC", `Insight row ${insightIndex} has unsupported metric ${metricName || "empty"}.`);
+    assertContract(
+      Array.isArray(insight.periods) && insight.periods.every(isRecord),
+      "INVALID_INSIGHT_PERIODS",
+      `${metricName} for EAN ${ean} must contain an array of period objects.`,
+    );
+    const periods = insight.periods as JsonRecord[];
     for (let periodIndex = 0; periodIndex < periods.length; periodIndex += 1) {
       const period = periods[periodIndex];
       const date = periodDate(period);
-      if (!date || date < claim.periodStart || date > claim.periodEnd) continue;
+      assertContract(date, "INVALID_INSIGHT_DATE", `${metricName} for EAN ${ean} has an invalid date at period ${periodIndex}.`);
+      assertContract(expectedInsightDates.has(date), "OUT_OF_PERIOD_INSIGHT", `${metricName} for EAN ${ean} contains ${date}, outside ${claim.periodStart} through ${claim.periodEnd}.`);
+      if (metricName === "BUY_BOX_PERCENTAGE") {
+        const buyBoxDateKey = `${ean}|${date}`;
+        assertContract(!seenBuyBoxDates.has(buyBoxDateKey), "DUPLICATE_BUY_BOX_DATE", `Buy Box data for EAN ${ean} contains date ${date} more than once.`);
+        seenBuyBoxDates.add(buyBoxDateKey);
+      }
       const total = numberValue(period.total ?? period.value ?? period.count);
       if (metricName === "PRODUCT_VISITS") {
         assertContract(total !== null && Number.isInteger(total) && total >= 0, "INVALID_PRODUCT_VISIT_TOTAL", `Product visits for EAN ${ean} on ${date} must be a nonnegative integer.`);
@@ -844,7 +877,13 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         facts.offer_insight_daily.push(await fact(fields, `${offerId}|${date}|${metricName}|TOTAL`, "insights", `/weekMetrics/offerInsights/${insightIndex}/periods/${periodIndex}`, date, now));
         metricFor(ean).visits = (metricFor(ean).visits || 0) + integer(total);
       }
-      const countries = rows(period.countries);
+      const countriesValue = period.countries ?? [];
+      assertContract(
+        Array.isArray(countriesValue) && countriesValue.every(isRecord),
+        "INVALID_INSIGHT_COUNTRIES",
+        `${metricName} for EAN ${ean} on ${date} must contain an array of country objects.`,
+      );
+      const countries = countriesValue as JsonRecord[];
       let validCountryCount = 0;
       for (let countryIndex = 0; countryIndex < countries.length; countryIndex += 1) {
         const country = countries[countryIndex];
@@ -956,10 +995,10 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const ranksReady = catalogReady && insightsReady && rankCombinations.size === expectedRankCalls && rankCalls.every(row => integer(row.status) === 200);
   qualityChecks.push(check("RANK_CALL_COVERAGE", "keyword_ranks", "error", ranksReady ? "passed" : "failed", ranksReady ? "All expected EAN/date/locale rank calls are present." : "Rank-call coverage is incomplete.", { combinations: expectedRankCalls }, { combinations: rankCombinations.size, rows: rankCalls.length, sourceDatasetStatus: insightsStatus }));
   const weeklyProductEans = [...productMetrics.keys()];
-  const visitCoverageReady = catalogReady && insightsReady && weeklyProductEans.every(ean => (visitDatesByEan.get(ean)?.size || 0) === 7);
-  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every weekly product has seven product-visit dates." : "At least one weekly product is missing product-visit dates or a required source dataset is incomplete.", { datesPerProduct: 7, sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries(weeklyProductEans.map(ean => [ean, visitDatesByEan.get(ean)?.size || 0])) }));
+  const visitCoverageReady = catalogReady && insightsReady && weeklyProductEans.every(ean => hasExactWeek(visitDatesByEan.get(ean)));
+  qualityChecks.push(check("PRODUCT_VISIT_DATE_COVERAGE", "product_visits", "error", visitCoverageReady ? "passed" : "failed", visitCoverageReady ? "Every weekly product has exactly the seven claimed product-visit dates." : "At least one weekly product is missing an exact claimed-week visit date set or a required source dataset is incomplete.", { dates: [...expectedInsightDates], sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries(weeklyProductEans.map(ean => [ean, [...(visitDatesByEan.get(ean) || [])].sort()])) }));
   const buyBoxInputsReady = catalogReady && insightsReady;
-  const buyBoxCoverageReady = buyBoxInputsReady && offers.every(offer => (buyBoxDatesByEan.get(text(offer.ean))?.size || 0) === 7);
+  const buyBoxCoverageReady = buyBoxInputsReady && offers.every(offer => hasExactWeek(buyBoxDatesByEan.get(text(offer.ean))));
   const buyBoxResult = !buyBoxInputsReady ? "failed" : buyBoxCoverageReady ? "passed" : "warning";
   qualityChecks.push(check("BUY_BOX_DATE_COVERAGE", "buy_box", buyBoxInputsReady ? "warning" : "error", buyBoxResult, buyBoxCoverageReady ? "Every current offer has seven Buy Box dates." : "At least one current offer is missing Buy Box dates or a required source dataset is incomplete; missing countries remain missing rather than zero.", { datesPerOffer: 7, sourceDatasetStatus: "complete" }, { catalogDatasetStatus: catalogStatus, insightsDatasetStatus: insightsStatus, datesByEan: Object.fromEntries([...buyBoxDatesByEan].map(([ean, dates]) => [ean, dates.size])) }));
   const invoicesReady = financialStatus === "complete";
