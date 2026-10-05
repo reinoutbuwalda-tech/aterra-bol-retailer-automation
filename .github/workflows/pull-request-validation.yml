@@ -59,7 +59,7 @@ jobs:
       - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
         with:
           deno-version: v2.9.7
-      - run: deno check --no-lock --node-modules-dir=auto supabase/functions/bol-retailer-transform/index.ts
+      - run: deno check --frozen --lock=deno.lock --node-modules-dir=none supabase/functions/bol-retailer-transform/index.ts
 
   full-chain-migration:
     name: Full Supabase migration chain and real pgmq cutover

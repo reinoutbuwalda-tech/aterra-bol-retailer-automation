@@ -479,6 +479,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const exceptions: JsonRecord[] = [];
 
   const shipmentCandidates = new Map<string, JsonRecord[]>();
+  const commercialEans = new Set<string>();
+  const commercialEanByOfferId = new Map<string, string>();
   const matchedReturnGroups = new Map<string, {
     candidate: JsonRecord;
     returns: Array<{ rmaId: string; expectedQuantity: number }>;
@@ -555,6 +557,15 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const unitPrice = numberValue(item.unitPrice);
       const commission = numberValue(item.commission);
       assertContract(orderItemId && /^\d{13}$/.test(ean) && quantityShipped > 0 && unitPrice !== null && commission !== null, "INVALID_SHIPMENT_ITEM", `Shipment ${shipmentId} contains an invalid business line.`);
+      commercialEans.add(ean);
+      const shipmentOfferId = nullableText(offer.offerId);
+      const existingCommercialOfferEan = shipmentOfferId ? commercialEanByOfferId.get(shipmentOfferId) : null;
+      assertContract(
+        !existingCommercialOfferEan || existingCommercialOfferEan === ean,
+        "COMMERCIAL_OFFER_ID_EAN_CONFLICT",
+        `Shipment offer ${shipmentOfferId} is associated with multiple EANs.`,
+      );
+      if (shipmentOfferId) commercialEanByOfferId.set(shipmentOfferId, ean);
       const shipmentItemKey = `${shipmentId}|${orderItemId}`;
       assertContract(!seenShipmentItemKeys.has(shipmentItemKey), "DUPLICATE_SHIPMENT_ITEM", `Shipment item ${shipmentItemKey} occurs more than once in the source.`);
       seenShipmentItemKeys.add(shipmentItemKey);
@@ -563,7 +574,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         order_id: orderId,
         order_item_id: orderItemId,
         ean,
-        offer_id: nullableText(offer.offerId),
+        offer_id: shipmentOfferId,
         product_title: nullableText(product.title),
         quantity_shipped: quantityShipped,
         unit_price: round(unitPrice, 2),
@@ -661,6 +672,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const orderId = nullableText(item.orderId);
       const expectedQuantity = integer(item.expectedQuantity);
       assertContract(rmaId && /^\d{13}$/.test(ean) && expectedQuantity > 0, "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
+      commercialEans.add(ean);
       assertContract(!seenRmas.has(rmaId), "DUPLICATE_RETURN_ITEM", `Return RMA ${rmaId} occurs more than once in the source.`);
       seenRmas.add(rmaId);
       const returnItemFields = {
@@ -781,6 +793,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const offers = rows(currentState.offers);
   const offerEans = new Set<string>();
   const offerIds = new Set<string>();
+  const catalogOfferByEan = new Map<string, string>();
+  const catalogEanByOfferId = new Map<string, string>();
   let fbbOffers = 0;
   for (let offerIndex = 0; offerIndex < offers.length; offerIndex += 1) {
     const offer = offers[offerIndex];
@@ -789,8 +803,16 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     assertContract(offerId && /^\d{13}$/.test(ean), "INVALID_CATALOG_OFFER", `Catalog offer ${offerIndex} is missing a valid offer ID or EAN.`);
     assertContract(!offerIds.has(offerId), "DUPLICATE_OFFER_ID", `Offer ID ${offerId} occurs more than once in the catalog source.`);
     assertContract(!offerEans.has(ean), "DUPLICATE_OFFER_EAN", `EAN ${ean} occurs more than once in the catalog source.`);
+    const commercialOfferEan = commercialEanByOfferId.get(offerId);
+    assertContract(
+      !commercialOfferEan || commercialOfferEan === ean,
+      "CATALOG_COMMERCIAL_OFFER_ID_CONFLICT",
+      `Catalog offer ${offerId} belongs to EAN ${ean}, but shipment evidence associates it with ${commercialOfferEan}.`,
+    );
     offerIds.add(offerId);
     offerEans.add(ean);
+    catalogOfferByEan.set(ean, offerId);
+    catalogEanByOfferId.set(offerId, ean);
     metricFor(ean);
     const stock = record(offer.stock);
     const product = record(offer.product);
@@ -880,6 +902,23 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     assertContract(/^\d{13}$/.test(ean), "INVALID_INSIGHT_EAN", `Insight row ${insightIndex} has an invalid EAN.`);
     assertContract(Boolean(offerId), "INVALID_INSIGHT_OFFER_ID", `Insight row ${insightIndex} has no offer ID.`);
     assertContract(["PRODUCT_VISITS", "BUY_BOX_PERCENTAGE"].includes(metricName), "INVALID_INSIGHT_METRIC", `Insight row ${insightIndex} has unsupported metric ${metricName || "empty"}.`);
+    const catalogOfferId = catalogOfferByEan.get(ean);
+    const knownOfferEan = catalogEanByOfferId.get(offerId) || commercialEanByOfferId.get(offerId);
+    assertContract(
+      Boolean(catalogOfferId) || commercialEans.has(ean),
+      "INSIGHT_EAN_WITHOUT_SOURCE_IDENTITY",
+      `Insight row ${insightIndex} references EAN ${ean}, which is absent from validated catalog and commercial evidence.`,
+    );
+    assertContract(
+      !knownOfferEan || knownOfferEan === ean,
+      "INSIGHT_OFFER_ID_BELONGS_TO_DIFFERENT_EAN",
+      `Insight row ${insightIndex} uses offer ${offerId}, which belongs to validated EAN ${knownOfferEan}.`,
+    );
+    assertContract(
+      !catalogOfferId || catalogOfferId === offerId,
+      "INSIGHT_OFFER_ID_MISMATCH",
+      `Insight row ${insightIndex} must use catalog offer ${catalogOfferId} for EAN ${ean}.`,
+    );
     assertContract(
       Array.isArray(insight.periods) && insight.periods.every(isRecord),
       "INVALID_INSIGHT_PERIODS",
@@ -1061,12 +1100,19 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }));
 
   const weeklyMetrics = [...productMetrics.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ean, metric]) => {
-    const grossGms = round(metric.grossGms, 2);
-    const grossCommission = round(metric.grossCommission, 2);
-    const linkedReturnGms = round(metric.linkedReturnGms, 2);
-    const linkedReturnCommission = round(metric.linkedReturnCommission, 2);
-    const provisionalNetGms = round(grossGms - linkedReturnGms, 2);
-    const provisionalAfterCommission = round(provisionalNetGms - (grossCommission - linkedReturnCommission), 2);
+    const unroundedGrossGms = metric.grossGms;
+    const unroundedGrossCommission = metric.grossCommission;
+    const unroundedLinkedReturnGms = metric.linkedReturnGms;
+    const unroundedLinkedReturnCommission = metric.linkedReturnCommission;
+    const unroundedProvisionalNetGms = unroundedGrossGms - unroundedLinkedReturnGms;
+    const unroundedProvisionalAfterCommission = unroundedProvisionalNetGms
+      - (unroundedGrossCommission - unroundedLinkedReturnCommission);
+    const grossGms = round(unroundedGrossGms, 2);
+    const grossCommission = round(unroundedGrossCommission, 2);
+    const linkedReturnGms = round(unroundedLinkedReturnGms, 2);
+    const linkedReturnCommission = round(unroundedLinkedReturnCommission, 2);
+    const provisionalNetGms = round(unroundedProvisionalNetGms, 2);
+    const provisionalAfterCommission = round(unroundedProvisionalAfterCommission, 2);
     const reportedVisits = visitCoverageReady ? metric.visits : null;
     const visitsStatus = reportedVisits === null ? "not_ready" : "ready";
     const returnsStatus = metric.unlinkedReturns > 0 ? "ready_with_limits" : "ready";
@@ -1082,7 +1128,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       linked_return_commission: linkedReturnCommission,
       provisional_net_gms: provisionalNetGms,
       provisional_revenue_after_commission: provisionalAfterCommission,
-      gross_shipped_asp: metric.grossUnits ? round(grossGms / metric.grossUnits, 4) : null,
+      gross_shipped_asp: metric.grossUnits ? round(unroundedGrossGms / metric.grossUnits, 4) : null,
       product_visits: reportedVisits,
       trading_units_per_visit: reportedVisits ? round(metric.grossUnits / reportedVisits, 6) : null,
       commercial_status: shipmentReady ? "ready" : "not_ready",
@@ -1094,10 +1140,19 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         "Trading units per visit is not order-cohort conversion.",
       ])],
       calculation_trace: {
+        roundingPolicy: "Each published monetary field is rounded once from unrounded source accumulators.",
+        unroundedInputs: {
+          grossShippedGms: unroundedGrossGms,
+          grossCommission: unroundedGrossCommission,
+          linkedReturnGms: unroundedLinkedReturnGms,
+          linkedReturnCommission: unroundedLinkedReturnCommission,
+          provisionalNetGms: unroundedProvisionalNetGms,
+          provisionalRevenueAfterCommission: unroundedProvisionalAfterCommission,
+        },
         grossShippedGms: `${metric.grossUnits} shipped units valued from outbound shipment lines`,
-        linkedReturnGms: `${metric.linkedReturns} return units matched by exact order ID and EAN`,
-        provisionalNetGms: `${grossGms} - ${linkedReturnGms} = ${provisionalNetGms}`,
-        revenueAfterCommission: `${provisionalNetGms} - (${grossCommission} - ${linkedReturnCommission}) = ${provisionalAfterCommission}`,
+        linkedReturnGms: `${metric.linkedReturns} return units allocated from exact shipment-line totals`,
+        provisionalNetGms: "unrounded gross shipped GMS - unrounded linked return GMS",
+        revenueAfterCommission: "unrounded provisional net GMS - (unrounded gross commission - unrounded linked return commission)",
       },
     };
   });

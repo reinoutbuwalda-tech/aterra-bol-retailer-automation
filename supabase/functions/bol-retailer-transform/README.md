@@ -27,8 +27,9 @@ The function uses a custom `x-aterra-cron-token` check, so Supabase gateway JWT 
   product universe and accidentally passing coverage.
 - Sales come from outbound shipment items.
 - Returns remain registered events. All RMAs that map to one unique shipment item are evaluated as one deterministic group. When aggregate return quantity exceeds shipped quantity, the whole group remains financially unallocated with an explicit exception; otherwise valuation uses the exact shipment-line gross and commission totals, proportionally for partial returns.
-- Gross ASP is calculated before returns.
+- Every monetary field and gross ASP is derived independently from unrounded source accumulators and rounded exactly once at publication; displayed rounded siblings are never reused as calculation inputs.
 - Malformed insight rows and any insight date outside the claimed week fail closed.
+- Insight EAN/offer identities are validated before facts are created: catalog EANs require their exact current offer ID; an offer ID known from catalog or shipment evidence for another EAN is always rejected; an EAN absent from catalog is accepted only when validated shipment or return evidence establishes it, preserving products that left the current catalog.
 - Buy Box percentages retain country and date and are never summed into a fabricated total.
 - Weekly visits require the exact seven claimed dates for every EAN in the weekly report,
   including sold or returned products absent from the current offer list. Partial
@@ -44,6 +45,6 @@ legacy insight dates belong to W37.
 Run the Edge type check and focused regression suite with:
 
 ```bash
-deno check --no-lock --node-modules-dir=auto supabase/functions/bol-retailer-transform/index.ts
+deno check --frozen --lock=deno.lock --node-modules-dir=none supabase/functions/bol-retailer-transform/index.ts
 node --test tests/retailer-cloud-extract.test.mjs tests/retailer-transform.test.mjs
 ```
