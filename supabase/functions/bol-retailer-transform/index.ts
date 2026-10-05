@@ -501,7 +501,7 @@ function collectRawJsonNumbers(textValue: string, label: string): RawJsonNumber[
       if (textValue.startsWith(literal, index)) { index += literal.length; return; }
     }
     const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(textValue.slice(index));
-    if (!match) fail("Expected JSON value");
+    if (match === null) throw new SyntaxError(`Expected JSON value at character ${index}`);
     const token = { path, source: match[0] };
     validateRawFinancialNumber(label, token);
     tokens.push(token);
