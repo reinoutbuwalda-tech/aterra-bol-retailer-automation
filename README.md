@@ -28,6 +28,12 @@ Access is enforced by both Clerk authentication and the server-side email-to-rol
 
 Database schema changes are stored in `supabase/migrations` and must pass Supabase security and performance advisors before production use.
 
+## Retailer data foundation
+
+- [Architecture and traceability](docs/bol-retailer-data-foundation.md)
+- [Cloud operations runbook](docs/bol-retailer-cloud-operations.md)
+- [Roadmap and remaining build plan](docs/bol-retailer-data-foundation-roadmap.md)
+
 ## Automatic finance intake
 
 The connection is deliberately Drive-first: Gmail attachments are classified and copied into `06 Finance / 00 Intake`; Drive file IDs, versions, source links and SHA-256 fingerprints are then registered in Supabase. New evidence remains `awaiting_validation` and cannot change P&L, cash flow, balance or BTW until deterministic checks and any required human approval succeed.
