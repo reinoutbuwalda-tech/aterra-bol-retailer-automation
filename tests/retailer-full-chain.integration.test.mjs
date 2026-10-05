@@ -13,13 +13,17 @@ if (!databaseUrl) {
 
 const migration = readFileSync(migrationPath, 'utf8');
 
-function psql(sql) {
+function psql(sql, { expectFailure = false } = {}) {
   const result = spawnSync('psql', [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-qAt'], {
     input: sql,
     encoding: 'utf8',
   });
   if (result.error) throw result.error;
-  assert.equal(result.status, 0, `SQL failed:\n${result.stderr}\n${result.stdout}`);
+  if (expectFailure) {
+    assert.notEqual(result.status, 0, `Expected SQL failure, but command succeeded:\n${result.stdout}`);
+  } else {
+    assert.equal(result.status, 0, `SQL failed:\n${result.stderr}\n${result.stdout}`);
+  }
   return result.stdout.trim();
 }
 
@@ -57,6 +61,24 @@ function assertDisposableSupabase() {
   );
 }
 
+function resetCutoverState() {
+  psql(String.raw`
+    truncate table public.bol_retailer_api_extract_runs cascade;
+    select pgmq.purge_queue('bol_retailer_transform');
+  `);
+}
+
+function assertV1StateIntact() {
+  const state = psql(String.raw`
+    select concat_ws('|',
+      position('retailer-transform-v1' in pg_get_functiondef('pipeline.enqueue_bol_retailer_transform()'::regprocedure)) > 0,
+      to_regprocedure('reporting.keep_best_active_data_product_revision()') is null,
+      not exists (select 1 from pipeline.transform_runs where transform_version = 'retailer-transform-v2')
+    );
+  `);
+  assert.equal(state, 't|t|t', 'Failed cutover must preserve v1 and leave no v2 schema/backfill state.');
+}
+
 test('the complete preceding migration chain exposes real pgmq and the v1 cutover state', () => {
   assertDisposableSupabase();
   const state = psql(String.raw`
@@ -70,6 +92,68 @@ test('the complete preceding migration chain exposes real pgmq and the v1 cutove
   assert.ok(pgmqVersion);
   assert.ok(Number(v1Position) > 0, 'Preceding chain must still expose the v1 enqueue function.');
   assert.equal(protectorAbsent, 't', 'The v2 migration must not already be present in the preceding-chain database.');
+});
+
+test('nonterminal transform runs abort v2 with no partial cutover state', () => {
+  assertDisposableSupabase();
+  resetCutoverState();
+  psql(String.raw`
+    insert into public.bol_retailer_api_extract_runs (
+      id, status, source_schema_version, iso_year, iso_week, period_start, period_end, started_at
+    ) values (
+      '41000000-0000-4000-8000-000000000001', 'running', '3.0',
+      2026, 40, '2026-09-28', '2026-10-04', now()
+    );
+    insert into pipeline.transform_runs (
+      source_run_id, source_contract_version, transform_version,
+      iso_year, iso_week, period_start, period_end, status
+    ) values (
+      '41000000-0000-4000-8000-000000000001', '3.0', 'retailer-transform-v1',
+      2026, 40, '2026-09-28', '2026-10-04', 'queued'
+    );
+  `);
+  psql(`begin;\n${migration}\ncommit;`, { expectFailure: true });
+  assertV1StateIntact();
+  assert.equal(psql("select count(*) from pipeline.transform_runs where transform_version = 'retailer-transform-v1';"), '1');
+});
+
+test('a visible real-pgmq backlog aborts v2 and rolls back schema and backfill', () => {
+  assertDisposableSupabase();
+  resetCutoverState();
+  psql(String.raw`
+    insert into public.bol_retailer_api_extract_runs (
+      id, status, source_schema_version, iso_year, iso_week, period_start, period_end,
+      started_at, completed_at, storage_path, snapshot_sha256, artifact_count
+    ) values (
+      '42000000-0000-4000-8000-000000000001', 'complete', '3.0',
+      2026, 41, '2026-10-05', '2026-10-11', now(), now(),
+      'retailer-api/test/visible/manifest.json', repeat('a', 64), 7
+    );
+    select pgmq.send('bol_retailer_transform', '{"transformVersion":"retailer-transform-v1"}'::jsonb);
+  `);
+  psql(`begin;\n${migration}\ncommit;`, { expectFailure: true });
+  assertV1StateIntact();
+  assert.equal(psql("select queue_length from pgmq.metrics('bol_retailer_transform');"), '1');
+});
+
+test('an in-flight real-pgmq message aborts v2 and rolls back schema and backfill', () => {
+  assertDisposableSupabase();
+  resetCutoverState();
+  psql(String.raw`
+    insert into public.bol_retailer_api_extract_runs (
+      id, status, source_schema_version, iso_year, iso_week, period_start, period_end,
+      started_at, completed_at, storage_path, snapshot_sha256, artifact_count
+    ) values (
+      '43000000-0000-4000-8000-000000000001', 'complete', '3.0',
+      2026, 42, '2026-10-12', '2026-10-18', now(), now(),
+      'retailer-api/test/inflight/manifest.json', repeat('b', 64), 7
+    );
+    select pgmq.send('bol_retailer_transform', '{"transformVersion":"retailer-transform-v1"}'::jsonb);
+    select msg_id from pgmq.read('bol_retailer_transform', 300, 1);
+  `);
+  psql(`begin;\n${migration}\ncommit;`, { expectFailure: true });
+  assertV1StateIntact();
+  assert.equal(psql("select queue_length from pgmq.metrics('bol_retailer_transform');"), '1');
 });
 
 test('real pgmq cutover blocks a concurrent source completion until v2 is committed', async () => {

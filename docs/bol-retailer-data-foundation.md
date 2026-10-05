@@ -99,11 +99,13 @@ table access; the service role performs controlled pipeline writes.
 | Trading units per visit | Gross shipped units divided by same-week visits. This is not cohort conversion. |
 
 An unmatched return stays visible as an exception and does not silently reduce revenue.
-All monetary fields and gross ASP are calculated from unrounded source accumulators and
-rounded independently exactly once at publication. Because displayed siblings are
-independently rounded, recomputing net values from those displayed siblings can differ by
-a cent; the calculation trace preserves the unrounded accounting identity. Settlement
-remains provisional until invoice and accounting reconciliation is approved.
+Shipment-line gross and commission are converted to integer minor units with decimal
+parsing, then aggregated without binary floating-point arithmetic. Grouped partial
+returns use deterministic half-up minor-unit allocation. Published monetary fields come
+directly from those integer identities, and the calculation trace preserves every minor-
+unit input. Provisional revenue after commission may be negative when exact commission
+exceeds provisional net GMS; it is retained rather than clamped. Settlement remains
+provisional until invoice and accounting reconciliation is approved.
 
 ## Readiness states
 
@@ -122,8 +124,9 @@ universe, so an incomplete catalog makes catalog offers, visits, ranks, Buy Box,
 FBB inventory `not_ready`. Every insight for a catalog EAN must use that EAN's exact
 validated offer ID, and an offer ID associated by catalog or shipment evidence with
 another EAN is rejected. An EAN absent from the current catalog may retain insight
-evidence only when validated shipment or return facts independently establish the product; an insight-only foreign
-EAN is rejected. Visit coverage is checked against every EAN that appears in
+evidence only when shipment facts establish one unique exact offer identity. Unknown or
+conflicting shipment offer IDs are rejected, and return-only evidence cannot verify an
+offer identity. An insight-only foreign EAN is rejected. Visit coverage is checked against every EAN that appears in
 the weekly report, including a product that shipped or returned during the week but is
 no longer in the current-offer list. One missing product therefore cannot hide behind
 otherwise complete current offers.

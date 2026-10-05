@@ -36,7 +36,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npm audit --audit-level=critical
 
   verify-windows:
     name: Windows unit gate (Node 24.10.0)
@@ -49,7 +48,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify:unit
-      - run: npm audit --audit-level=critical
+      - run: npm run audit:policy
 
   edge-function-check:
     name: Deno Edge Function check (Deno 2.9.7)

@@ -14,7 +14,8 @@
     "test:migration": "node --test tests/retailer-migration.integration.test.mjs",
     "test:migration:full-chain": "node --test tests/retailer-full-chain.integration.test.mjs",
     "verify:unit": "npm run lint && npm run build && npm run test:unit",
-    "verify": "npm run verify:unit && npm run test:migration",
+    "verify": "npm run verify:unit && npm run test:migration && npm run audit:policy",
+    "audit:policy": "node scripts/check-npm-audit.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "verify:benchmark": "node scripts/verify-may-benchmark.mjs"
   },

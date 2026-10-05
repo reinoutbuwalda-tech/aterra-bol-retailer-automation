@@ -198,6 +198,12 @@ session attempts source completion. The fixtures do not substitute for pgmq, tra
 tables, triggers, promotion SQL, or migration behavior. That full-chain job is the
 release evidence for extension compatibility and the cutover race.
 
+`npm run audit:policy` requires zero critical advisories across all dependencies and zero
+high advisories in production dependencies. The only development-high exception is the
+exact ESLint-chain advisory recorded in `security/npm-audit-high-allowlist.json`, including
+its owning maintainers, rationale, affected package set, and expiry. CI fails if that
+entry expires or if the advisory/package set changes.
+
 `node --test tests/retailer-cloud-extract.test.mjs` runs the collector regression cases.
 The 19 September cloud validation made 221 API calls with zero final API errors,
 wrote seven verified files in 48,519 ms, and returned HTTP 200 without timeout.

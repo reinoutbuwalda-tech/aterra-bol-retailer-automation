@@ -335,6 +335,15 @@ test('parsed artifact envelopes agree with their manifest', () => {
   );
 });
 
+test('date-only parsing requires canonical calendar-valid YYYY-MM-DD values', () => {
+  const context = transformer();
+  assert.equal(context.isoDate('2028-02-29'), '2028-02-29');
+  assert.equal(context.isoDate('2026-02-29'), null);
+  assert.equal(context.isoDate('2026-02-30'), null);
+  assert.equal(context.isoDate('2026-09-21T00:00:00Z'), null);
+  assert.equal(context.isoDate('2026-09-21suffix'), null);
+});
+
 test('W39 canonical trading metrics reconcile to the reviewed workbook', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
@@ -531,25 +540,36 @@ test('a return quantity larger than its exact shipment match remains unlinked', 
   assert.equal(publication.exceptions.some(row => row.exception_code === 'RETURN_GROUP_QUANTITY_EXCEEDS_SHIPMENT'), true);
 });
 
-test('distinct returns can cumulatively allocate exactly the shipped quantity', async () => {
-  const context = transformer();
-  const { claim, loaded } = canonicalInput();
-  const returnCase = loaded.artifacts.commercial.operational.returns
-    .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
-  returnCase.returnItems.push({
-    rmaId: 'rma-linked-carafe-second',
-    orderId: 'order-2',
-    ean: '8720892887504',
-    expectedQuantity: 3,
-    handled: false,
-    returnReason: { mainReason: 'Quality' },
-  });
+test('valid cumulative return allocation is permutation-invariant', async () => {
+  const runPermutation = async reverse => {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    const returnCase = loaded.artifacts.commercial.operational.returns
+      .find(row => row.returnItems.some(item => item.ean === '8720892887504'));
+    const original = structuredClone(returnCase.returnItems[0]);
+    const returns = [
+      { ...original, rmaId: 'rma-valid-a', expectedQuantity: 1 },
+      { ...original, rmaId: 'rma-valid-b', expectedQuantity: 3 },
+    ];
+    returnCase.returnItems = reverse ? returns.reverse() : returns;
+    const publication = await context.buildPublication(claim, loaded);
+    return publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
+  };
 
-  const publication = await context.buildPublication(claim, loaded);
-  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
-  assert.equal(metric.linked_return_units, 4);
-  assert.equal(metric.unlinked_return_units, 0);
-  assert.equal(metric.linked_return_gms, metric.gross_shipped_gms);
+  const forward = await runPermutation(false);
+  const reversed = await runPermutation(true);
+  for (const metric of [forward, reversed]) {
+    assert.equal(metric.linked_return_units, 4);
+    assert.equal(metric.unlinked_return_units, 0);
+    assert.equal(metric.linked_return_gms, metric.gross_shipped_gms);
+    assert.equal(metric.linked_return_commission, metric.gross_commission);
+    assert.equal(metric.provisional_net_gms, 0);
+    assert.equal(metric.provisional_revenue_after_commission, 0);
+  }
+  assert.equal(
+    JSON.stringify(forward.calculation_trace.minorUnits),
+    JSON.stringify(reversed.calculation_trace.minorUnits),
+  );
 });
 
 test('a full return reverses the exact recurring-decimal shipment total and commission', async () => {
@@ -588,30 +608,61 @@ test('a partial return uses the exact shipment-line valuation ratio', async () =
   assert.equal(metric.linked_return_gms, 88.68);
   assert.equal(metric.linked_return_commission, 16.76);
   assert.equal(metric.provisional_net_gms, 118.25);
-  assert.equal(metric.provisional_revenue_after_commission, 95.9);
-  const raw = metric.calculation_trace.unroundedInputs;
-  assert.ok(Math.abs(raw.provisionalNetGms - (raw.grossShippedGms - raw.linkedReturnGms)) < 1e-12);
-  assert.ok(Math.abs(
-    raw.provisionalRevenueAfterCommission
-      - (raw.provisionalNetGms - (raw.grossCommission - raw.linkedReturnCommission)),
-  ) < 1e-12);
+  assert.equal(metric.provisional_revenue_after_commission, 95.91);
+  const minor = Object.fromEntries(
+    Object.entries(metric.calculation_trace.minorUnits).map(([key, value]) => [key, BigInt(value)]),
+  );
+  assert.equal(minor.linkedReturnGms, 8868n);
+  assert.equal(minor.linkedReturnCommission, 1676n);
+  assert.equal(minor.provisionalNetGms, minor.grossShippedGms - minor.linkedReturnGms);
+  assert.equal(
+    minor.provisionalRevenueAfterCommission,
+    minor.provisionalNetGms - (minor.grossCommission - minor.linkedReturnCommission),
+  );
 });
 
-test('sub-cent multiple-line publication rounds each accounting result from raw accumulators', async () => {
+test('a 20.15 line allocated one-half rounds deterministically to 10.08', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const shipment = loaded.artifacts.commercial.operational.shipmentDetails
+    .find(row => row.detail.order.orderId === 'order-3');
+  shipment.detail.shipmentItems[0].quantityShipped = 2;
+  shipment.detail.shipmentItems[0].unitPrice = 10.075;
+  shipment.detail.shipmentItems[0].commission = 0;
+  const linkedReturn = loaded.artifacts.commercial.operational.returns
+    .flatMap(row => row.returnItems)
+    .find(item => item.ean === '8720892887504');
+  linkedReturn.orderId = 'order-3';
+  linkedReturn.ean = '8720892887511';
+  linkedReturn.expectedQuantity = 1;
+
+  const publication = await context.buildPublication(claim, loaded);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887511');
+  assert.equal(metric.gross_shipped_gms, 20.15);
+  assert.equal(metric.linked_return_gms, 10.08);
+  assert.equal(metric.provisional_net_gms, 10.07);
+  assert.equal(metric.gross_shipped_asp, 10.075);
+  assert.equal(metric.calculation_trace.minorUnits.linkedReturnGms, '1008');
+  assert.equal(context.allocateMinor(-2015n, 1, 2), -1008n);
+});
+
+test('multiple shipment lines aggregate and reconcile in exact minor units', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
   const primary = loaded.artifacts.commercial.operational.shipmentDetails
     .find(row => row.detail.order.orderId === 'order-2');
   const primaryItem = primary.detail.shipmentItems[0];
   primaryItem.quantityShipped = 1;
-  primaryItem.unitPrice = 0.006;
-  primaryItem.commission = 0.006;
+  primaryItem.unitPrice = 10.01;
+  primaryItem.commission = 1.01;
 
   const second = structuredClone(primary);
-  second.shipmentId = 'shipment-rounding-second';
-  second.detail.shipmentId = 'shipment-rounding-second';
-  second.detail.order.orderId = 'order-rounding-second';
-  second.detail.shipmentItems[0].orderItemId = 'order-item-rounding-second';
+  second.shipmentId = 'shipment-minor-second';
+  second.detail.shipmentId = 'shipment-minor-second';
+  second.detail.order.orderId = 'order-minor-second';
+  second.detail.shipmentItems[0].orderItemId = 'order-item-minor-second';
+  second.detail.shipmentItems[0].unitPrice = 10.02;
+  second.detail.shipmentItems[0].commission = 1.02;
   loaded.artifacts.commercial.operational.shipmentDetails.push(second);
 
   const linkedReturn = loaded.artifacts.commercial.operational.returns
@@ -621,25 +672,40 @@ test('sub-cent multiple-line publication rounds each accounting result from raw 
 
   const publication = await context.buildPublication(claim, loaded);
   const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887504');
-  const raw = metric.calculation_trace.unroundedInputs;
-  assert.equal(metric.gross_shipped_units, 2);
-  assert.equal(metric.gross_shipped_gms, 0.01);
-  assert.equal(metric.linked_return_gms, 0.01);
-  assert.equal(metric.provisional_net_gms, 0.01);
-  assert.equal(metric.gross_commission, 0.01);
-  assert.equal(metric.linked_return_commission, 0.01);
-  assert.equal(metric.provisional_revenue_after_commission, 0);
-  assert.equal(metric.gross_shipped_asp, 0.006);
-  assert.notEqual(
-    metric.provisional_net_gms,
-    metric.gross_shipped_gms - metric.linked_return_gms,
-    'This fixture must distinguish round(raw gross - raw return) from rounded sibling subtraction.',
+  const minor = Object.fromEntries(
+    Object.entries(metric.calculation_trace.minorUnits).map(([key, value]) => [key, BigInt(value)]),
   );
-  assert.ok(Math.abs(raw.provisionalNetGms - (raw.grossShippedGms - raw.linkedReturnGms)) < 1e-12);
-  assert.ok(Math.abs(
-    raw.provisionalRevenueAfterCommission
-      - (raw.provisionalNetGms - (raw.grossCommission - raw.linkedReturnCommission)),
-  ) < 1e-12);
+  assert.equal(metric.gross_shipped_units, 2);
+  assert.equal(metric.gross_shipped_gms, 20.03);
+  assert.equal(metric.linked_return_gms, 10.01);
+  assert.equal(metric.provisional_net_gms, 10.02);
+  assert.equal(metric.gross_commission, 2.03);
+  assert.equal(metric.linked_return_commission, 1.01);
+  assert.equal(metric.provisional_revenue_after_commission, 9);
+  assert.equal(metric.gross_shipped_asp, 10.015);
+  assert.equal(minor.provisionalNetGms, minor.grossShippedGms - minor.linkedReturnGms);
+  assert.equal(
+    minor.provisionalRevenueAfterCommission,
+    minor.provisionalNetGms - (minor.grossCommission - minor.linkedReturnCommission),
+  );
+});
+
+test('revenue after commission can be negative without unsigned rounding artifacts', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const shipment = loaded.artifacts.commercial.operational.shipmentDetails
+    .find(row => row.detail.order.orderId === 'order-4');
+  shipment.detail.shipmentItems[0].quantityShipped = 1;
+  shipment.detail.shipmentItems[0].unitPrice = 1;
+  shipment.detail.shipmentItems[0].commission = 2;
+
+  const publication = await context.buildPublication(claim, loaded);
+  const metric = publication.weeklyReport.metrics.find(row => row.ean === '8720892887528');
+  assert.equal(metric.gross_shipped_gms, 1);
+  assert.equal(metric.gross_commission, 2);
+  assert.equal(metric.provisional_net_gms, 1);
+  assert.equal(metric.provisional_revenue_after_commission, -1);
+  assert.equal(metric.calculation_trace.minorUnits.provisionalRevenueAfterCommission, '-100');
 });
 
 test('cumulative return overflow is permutation-invariant and wholly unallocated', async () => {
@@ -815,11 +881,103 @@ test('a commercial-only EAN keeps valid insight evidence after leaving the catal
   assert.ok(publication.weeklyReport.metrics.some(row => row.ean === commercialOnlyEan));
 });
 
-test('an invalid insight period date fails closed', async () => {
+test('a commercial-only EAN rejects an unknown offer ID', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const ean = '8720892887511';
+  loaded.artifacts.catalog.currentState.offers = loaded.artifacts.catalog.currentState.offers
+    .filter(row => row.ean !== ean);
+  loaded.artifacts.insights.ranks = loaded.artifacts.insights.ranks.filter(row => row.ean !== ean);
+  for (const insight of loaded.artifacts.insights.weekMetrics.offerInsights.filter(row => row.ean === ean)) {
+    insight.offerId = 'offer-typo';
+  }
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INSIGHT_COMMERCIAL_OFFER_ID_MISMATCH',
+  );
+});
+
+test('a commercial-only EAN rejects an offer ID belonging to another EAN', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const ean = '8720892887511';
+  loaded.artifacts.catalog.currentState.offers = loaded.artifacts.catalog.currentState.offers
+    .filter(row => row.ean !== ean);
+  loaded.artifacts.insights.ranks = loaded.artifacts.insights.ranks.filter(row => row.ean !== ean);
+  for (const insight of loaded.artifacts.insights.weekMetrics.offerInsights.filter(row => row.ean === ean)) {
+    insight.offerId = 'offer-fruit-carafe';
+  }
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INSIGHT_OFFER_ID_BELONGS_TO_DIFFERENT_EAN',
+  );
+});
+
+test('a commercial-only EAN rejects conflicting historical shipment offer IDs', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const ean = '8720892887511';
+  loaded.artifacts.catalog.currentState.offers = loaded.artifacts.catalog.currentState.offers
+    .filter(row => row.ean !== ean);
+  loaded.artifacts.insights.ranks = loaded.artifacts.insights.ranks.filter(row => row.ean !== ean);
+  const alternate = structuredClone(
+    loaded.artifacts.commercial.operational.shipmentDetails.find(row => row.detail.order.orderId === 'order-3'),
+  );
+  alternate.shipmentId = 'shipment-steel-alternate';
+  alternate.detail.shipmentId = 'shipment-steel-alternate';
+  alternate.detail.order.orderId = 'order-steel-alternate';
+  alternate.detail.shipmentItems[0].orderItemId = 'order-item-steel-alternate';
+  alternate.detail.shipmentItems[0].offer.offerId = 'offer-steel-alternate';
+  loaded.artifacts.commercial.operational.shipmentDetails.push(alternate);
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INSIGHT_COMMERCIAL_OFFER_IDENTITY_AMBIGUOUS',
+  );
+});
+
+test('a return-only EAN cannot establish a trusted insight offer identity', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const ean = '1234567890123';
+  loaded.artifacts.commercial.operational.returns[0].returnItems.push({
+    rmaId: 'rma-return-only', orderId: 'order-absent', ean, expectedQuantity: 1, handled: false,
+  });
+  const insight = structuredClone(loaded.artifacts.insights.weekMetrics.offerInsights[0]);
+  insight.ean = ean;
+  insight.offerId = 'offer-return-only';
+  loaded.artifacts.insights.weekMetrics.offerInsights.push(insight);
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INSIGHT_COMMERCIAL_OFFER_IDENTITY_MISSING',
+  );
+});
+
+test('canonical direct insight dates are accepted without truncation', async () => {
   const context = transformer();
   const { claim, loaded } = canonicalInput();
   const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
-  visits.periods[0].period = {};
+  visits.periods[0].date = '2026-09-21';
+  delete visits.periods[0].period;
+  await assert.doesNotReject(context.buildPublication(claim, loaded));
+});
+
+test('an insight date with a suffix fails closed', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
+  visits.periods[0].date = '2026-09-21T00:00:00Z';
+  delete visits.periods[0].period;
+  await assert.rejects(
+    context.buildPublication(claim, loaded),
+    error => error.code === 'INVALID_INSIGHT_DATE',
+  );
+});
+
+test('an impossible structured insight date fails closed', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const visits = loaded.artifacts.insights.weekMetrics.offerInsights.find(row => row.metric === 'PRODUCT_VISITS');
+  visits.periods[0].period = { year: 2026, month: 2, day: 30 };
   await assert.rejects(
     context.buildPublication(claim, loaded),
     error => error.code === 'INVALID_INSIGHT_DATE',
@@ -846,6 +1004,25 @@ test('visit date coverage requires a valid nonnegative total', async () => {
     context.buildPublication(claim, loaded),
     error => error.code === 'INVALID_PRODUCT_VISIT_TOTAL',
   );
+});
+
+test('canonical rank dates are accepted exactly', async () => {
+  const context = transformer();
+  const { claim, loaded } = canonicalInput();
+  const publication = await context.buildPublication(claim, loaded);
+  assert.equal(publication.facts.keyword_rank_daily[0].rank_date, '2026-09-21');
+});
+
+test('rank dates reject timestamp suffixes and impossible calendar dates', async () => {
+  for (const invalidDate of ['2026-09-21T00:00:00Z', '2026-02-30']) {
+    const context = transformer();
+    const { claim, loaded } = canonicalInput();
+    loaded.artifacts.insights.ranks[0].date = invalidDate;
+    await assert.rejects(
+      context.buildPublication(claim, loaded),
+      error => error.code === 'INVALID_RANK_DATE',
+    );
+  }
 });
 
 test('rank calls outside the reporting week fail closed', async () => {

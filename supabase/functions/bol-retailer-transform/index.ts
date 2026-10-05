@@ -124,11 +124,76 @@ function round(value: number, decimals = 2) {
   return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
+type DecimalFraction = { numerator: bigint; denominator: bigint };
+
+function decimalFraction(value: unknown): DecimalFraction | null {
+  if ((typeof value !== "number" && typeof value !== "string") || value === "") return null;
+  const source = String(value).trim();
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(source);
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1n : 1n;
+  const fractionDigits = match[3] || "";
+  const exponent = Number(match[4] || 0);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 30) return null;
+  const digits = BigInt(`${match[2]}${fractionDigits}`);
+  const scale = fractionDigits.length - exponent;
+  if (Math.abs(scale) > 30) return null;
+  if (scale >= 0) return { numerator: sign * digits, denominator: 10n ** BigInt(scale) };
+  return { numerator: sign * digits * (10n ** BigInt(-scale)), denominator: 1n };
+}
+
+function divideHalfUp(numerator: bigint, denominator: bigint) {
+  if (denominator <= 0n) throw new Error("A positive denominator is required.");
+  const sign = numerator < 0n ? -1n : 1n;
+  const absolute = numerator < 0n ? -numerator : numerator;
+  const quotient = absolute / denominator;
+  const remainder = absolute % denominator;
+  const rounded = remainder * 2n >= denominator ? quotient + 1n : quotient;
+  return sign * rounded;
+}
+
+function moneyToMinor(value: unknown) {
+  const fraction = decimalFraction(value);
+  if (!fraction) return null;
+  return divideHalfUp(fraction.numerator * 100n, fraction.denominator);
+}
+
+function lineGrossToMinor(unitPrice: unknown, quantity: number) {
+  const fraction = decimalFraction(unitPrice);
+  if (!fraction || !Number.isSafeInteger(quantity)) return null;
+  return divideHalfUp(fraction.numerator * BigInt(quantity) * 100n, fraction.denominator);
+}
+
+function allocateMinor(totalMinor: bigint, quantity: number, totalQuantity: number) {
+  return divideHalfUp(totalMinor * BigInt(quantity), BigInt(totalQuantity));
+}
+
+function scaledRatioToNumber(numerator: bigint, denominator: bigint, decimals: number) {
+  const scale = 10n ** BigInt(decimals);
+  const scaled = divideHalfUp(numerator * scale, denominator);
+  const numeric = Number(scaled);
+  if (!Number.isSafeInteger(numeric)) throw new PermanentTransformError("MONEY_OUT_OF_RANGE", "Monetary value exceeds the safe publication range.");
+  return numeric / Number(scale);
+}
+
+function minorToMajor(value: bigint) {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric)) throw new PermanentTransformError("MONEY_OUT_OF_RANGE", "Monetary value exceeds the safe publication range.");
+  return numeric / 100;
+}
+
 function isoDate(value: unknown): string | null {
-  if (typeof value === "number" && Number.isFinite(value)) return new Date(value).toISOString().slice(0, 10);
-  const result = text(value);
-  if (/^\d{4}-\d{2}-\d{2}/.test(result)) return result.slice(0, 10);
-  return null;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) return null;
+  return value;
+}
+
+function dateFromTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4}-\d{2}-\d{2})T/.exec(value);
+  if (!match || !isoDate(match[1]) || !isoTimestamp(value)) return null;
+  return match[1];
 }
 
 function isoTimestamp(value: unknown): string | null {
@@ -159,14 +224,13 @@ function addUtcDays(date: string, days: number) {
 }
 
 function periodDate(value: JsonRecord): string | null {
-  const direct = isoDate(value.date);
-  if (direct) return direct;
+  if ("date" in value) return isoDate(value.date);
   const period = record(value.period);
-  const year = integer(period.year);
-  const month = integer(period.month);
-  const day = integer(period.day);
-  if (!year || !month || !day) return null;
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (![period.year, period.month, period.day].every(part => typeof part === "number" && Number.isInteger(part))) return null;
+  const year = period.year as number;
+  const month = period.month as number;
+  const day = period.day as number;
+  return isoDate(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
 }
 
 function amount(value: unknown): number | null {
@@ -481,26 +545,27 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   const shipmentCandidates = new Map<string, JsonRecord[]>();
   const commercialEans = new Set<string>();
   const commercialEanByOfferId = new Map<string, string>();
+  const commercialOfferIdsByEan = new Map<string, Set<string>>();
   const matchedReturnGroups = new Map<string, {
     candidate: JsonRecord;
     returns: Array<{ rmaId: string; expectedQuantity: number }>;
   }>();
   const productMetrics = new Map<string, {
     grossUnits: number;
-    grossGms: number;
-    grossCommission: number;
+    grossGmsMinor: bigint;
+    grossCommissionMinor: bigint;
     registeredReturns: number;
     linkedReturns: number;
     unlinkedReturns: number;
-    linkedReturnGms: number;
-    linkedReturnCommission: number;
+    linkedReturnGmsMinor: bigint;
+    linkedReturnCommissionMinor: bigint;
     visits: number | null;
     limitations: string[];
   }>();
   const metricFor = (ean: string) => {
     const existing = productMetrics.get(ean);
     if (existing) return existing;
-    const created = { grossUnits: 0, grossGms: 0, grossCommission: 0, registeredReturns: 0, linkedReturns: 0, unlinkedReturns: 0, linkedReturnGms: 0, linkedReturnCommission: 0, visits: null, limitations: [] as string[] };
+    const created = { grossUnits: 0, grossGmsMinor: 0n, grossCommissionMinor: 0n, registeredReturns: 0, linkedReturns: 0, unlinkedReturns: 0, linkedReturnGmsMinor: 0n, linkedReturnCommissionMinor: 0n, visits: null, limitations: [] as string[] };
     productMetrics.set(ean, created);
     return created;
   };
@@ -522,7 +587,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const order = record(detail.order);
     const orderId = nullableText(order.orderId);
     const shipmentAt = isoTimestamp(detail.shipmentDateTime);
-    const shipmentDate = isoDate(detail.shipmentDateTime);
+    const shipmentDate = dateFromTimestamp(detail.shipmentDateTime);
     assertContract(shipmentAt, "INVALID_SHIPMENT_DATE", `Shipment ${shipmentId} has no valid shipment timestamp.`);
     assertContract(
       shipmentDate && shipmentDate >= claim.periodStart && shipmentDate <= claim.periodEnd,
@@ -556,7 +621,17 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const quantityShipped = integer(item.quantityShipped ?? item.quantity);
       const unitPrice = numberValue(item.unitPrice);
       const commission = numberValue(item.commission);
-      assertContract(orderItemId && /^\d{13}$/.test(ean) && quantityShipped > 0 && unitPrice !== null && commission !== null, "INVALID_SHIPMENT_ITEM", `Shipment ${shipmentId} contains an invalid business line.`);
+      const lineGrossMinor = unitPrice === null ? null : lineGrossToMinor(unitPrice, quantityShipped);
+      const unitPriceMinor = unitPrice === null ? null : moneyToMinor(unitPrice);
+      const commissionMinor = commission === null ? null : moneyToMinor(commission);
+      assertContract(
+        orderItemId && /^\d{13}$/.test(ean) && quantityShipped > 0
+          && lineGrossMinor !== null && lineGrossMinor >= 0n
+          && unitPriceMinor !== null && unitPriceMinor >= 0n
+          && commissionMinor !== null && commissionMinor >= 0n,
+        "INVALID_SHIPMENT_ITEM",
+        `Shipment ${shipmentId} contains an invalid business line.`,
+      );
       commercialEans.add(ean);
       const shipmentOfferId = nullableText(offer.offerId);
       const existingCommercialOfferEan = shipmentOfferId ? commercialEanByOfferId.get(shipmentOfferId) : null;
@@ -565,7 +640,12 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         "COMMERCIAL_OFFER_ID_EAN_CONFLICT",
         `Shipment offer ${shipmentOfferId} is associated with multiple EANs.`,
       );
-      if (shipmentOfferId) commercialEanByOfferId.set(shipmentOfferId, ean);
+      if (shipmentOfferId) {
+        commercialEanByOfferId.set(shipmentOfferId, ean);
+        const eanOfferIds = commercialOfferIdsByEan.get(ean) || new Set<string>();
+        eanOfferIds.add(shipmentOfferId);
+        commercialOfferIdsByEan.set(ean, eanOfferIds);
+      }
       const shipmentItemKey = `${shipmentId}|${orderItemId}`;
       assertContract(!seenShipmentItemKeys.has(shipmentItemKey), "DUPLICATE_SHIPMENT_ITEM", `Shipment item ${shipmentItemKey} occurs more than once in the source.`);
       seenShipmentItemKeys.add(shipmentItemKey);
@@ -577,8 +657,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         offer_id: shipmentOfferId,
         product_title: nullableText(product.title),
         quantity_shipped: quantityShipped,
-        unit_price: round(unitPrice, 2),
-        commission: round(commission, 2),
+        unit_price: minorToMajor(unitPriceMinor),
+        commission: minorToMajor(commissionMinor),
         fulfilment_method: nullableText(fulfilment.method),
         distribution_party: nullableText(fulfilment.distributionParty),
         latest_delivery_date: isoDate(fulfilment.latestDeliveryDate),
@@ -588,15 +668,15 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const candidate = {
         ...itemFields,
         sourcePointer,
-        _exact_line_gms: quantityShipped * unitPrice,
-        _exact_commission: commission,
+        _line_gross_minor: lineGrossMinor,
+        _commission_minor: commissionMinor,
       };
       const matchKey = `${orderId || ""}|${ean}`;
       shipmentCandidates.set(matchKey, [...(shipmentCandidates.get(matchKey) || []), candidate]);
       const metric = metricFor(ean);
       metric.grossUnits += quantityShipped;
-      metric.grossGms += quantityShipped * unitPrice;
-      metric.grossCommission += commission;
+      metric.grossGmsMinor += lineGrossMinor;
+      metric.grossCommissionMinor += commissionMinor;
     }
   }
 
@@ -654,7 +734,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const returnRow = returnRows[returnIndex];
     const returnId = text(returnRow.returnId);
     const registeredAt = isoTimestamp(returnRow.registrationDateTime);
-    const registeredDate = isoDate(returnRow.registrationDateTime);
+    const registeredDate = dateFromTimestamp(returnRow.registrationDateTime);
     assertContract(returnId && registeredAt, "INVALID_RETURN_CASE", `Return row ${returnIndex} is missing its ID or registration timestamp.`);
     assertContract(
       registeredDate && registeredDate >= claim.periodStart && registeredDate <= claim.periodEnd,
@@ -671,7 +751,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       const ean = text(item.ean);
       const orderId = nullableText(item.orderId);
       const expectedQuantity = integer(item.expectedQuantity);
-      assertContract(rmaId && /^\d{13}$/.test(ean) && expectedQuantity > 0, "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
+      assertContract(rmaId && /^\d{13}$/.test(ean) && Number.isSafeInteger(expectedQuantity) && expectedQuantity > 0, "INVALID_RETURN_ITEM", `Return ${returnId} contains an invalid item at index ${itemIndex}.`);
       commercialEans.add(ean);
       assertContract(!seenRmas.has(rmaId), "DUPLICATE_RETURN_ITEM", `Return RMA ${rmaId} occurs more than once in the source.`);
       seenRmas.add(rmaId);
@@ -743,14 +823,13 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const shipmentQuantity = integer(candidate.quantity_shipped);
     const groupedReturns = [...group.returns].sort((left, right) => left.rmaId.localeCompare(right.rmaId));
     const aggregateReturnQuantity = groupedReturns.reduce((sum, item) => sum + item.expectedQuantity, 0);
-    const exactLineGms = numberValue(candidate._exact_line_gms) || 0;
-    const exactCommission = numberValue(candidate._exact_commission) || 0;
+    const lineGrossMinor = candidate._line_gross_minor as bigint;
+    const commissionMinor = candidate._commission_minor as bigint;
 
     if (aggregateReturnQuantity <= shipmentQuantity) {
-      const allocationRatio = aggregateReturnQuantity / shipmentQuantity;
       metric.linkedReturns += aggregateReturnQuantity;
-      metric.linkedReturnGms += exactLineGms * allocationRatio;
-      metric.linkedReturnCommission += exactCommission * allocationRatio;
+      metric.linkedReturnGmsMinor += allocateMinor(lineGrossMinor, aggregateReturnQuantity, shipmentQuantity);
+      metric.linkedReturnCommissionMinor += allocateMinor(commissionMinor, aggregateReturnQuantity, shipmentQuantity);
       continue;
     }
 
@@ -914,11 +993,30 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       "INSIGHT_OFFER_ID_BELONGS_TO_DIFFERENT_EAN",
       `Insight row ${insightIndex} uses offer ${offerId}, which belongs to validated EAN ${knownOfferEan}.`,
     );
-    assertContract(
-      !catalogOfferId || catalogOfferId === offerId,
-      "INSIGHT_OFFER_ID_MISMATCH",
-      `Insight row ${insightIndex} must use catalog offer ${catalogOfferId} for EAN ${ean}.`,
-    );
+    if (catalogOfferId) {
+      assertContract(
+        catalogOfferId === offerId,
+        "INSIGHT_OFFER_ID_MISMATCH",
+        `Insight row ${insightIndex} must use catalog offer ${catalogOfferId} for EAN ${ean}.`,
+      );
+    } else {
+      const commercialOfferIds = commercialOfferIdsByEan.get(ean);
+      assertContract(
+        commercialOfferIds && commercialOfferIds.size > 0,
+        "INSIGHT_COMMERCIAL_OFFER_IDENTITY_MISSING",
+        `Insight row ${insightIndex} references commercial-only EAN ${ean} without a validated shipment offer identity.`,
+      );
+      assertContract(
+        commercialOfferIds.size === 1,
+        "INSIGHT_COMMERCIAL_OFFER_IDENTITY_AMBIGUOUS",
+        `Commercial-only EAN ${ean} has conflicting shipment offer identities.`,
+      );
+      assertContract(
+        commercialOfferIds.has(offerId),
+        "INSIGHT_COMMERCIAL_OFFER_ID_MISMATCH",
+        `Insight row ${insightIndex} must use the unique validated shipment offer for commercial-only EAN ${ean}.`,
+      );
+    }
     assertContract(
       Array.isArray(insight.periods) && insight.periods.every(isRecord),
       "INVALID_INSIGHT_PERIODS",
@@ -989,7 +1087,8 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
     const rankRows = rows(record(rankCall.data).ranks ?? record(rankCall.sample).ranks);
     if (integer(rankCall.status) !== 200) continue;
     assertContract(offerEans.has(ean), "UNEXPECTED_RANK_EAN", `Rank call ${callIndex} references EAN ${ean}, which is not in the catalog.`);
-    assertContract(rankDate && rankDate >= claim.periodStart && rankDate <= claim.periodEnd, "OUT_OF_PERIOD_RANK_CALL", `Rank call ${callIndex} is outside ${claim.periodStart} through ${claim.periodEnd}.`);
+    assertContract(rankDate, "INVALID_RANK_DATE", `Rank call ${callIndex} must use a canonical calendar-valid YYYY-MM-DD date.`);
+    assertContract(rankDate >= claim.periodStart && rankDate <= claim.periodEnd, "OUT_OF_PERIOD_RANK_CALL", `Rank call ${callIndex} is outside ${claim.periodStart} through ${claim.periodEnd}.`);
     assertContract(EXPECTED_RANK_LOCALES.has(locale), "UNEXPECTED_RANK_LOCALE", `Rank call ${callIndex} uses unsupported locale ${locale}.`);
     assertContract(rankType === "SEARCH", "UNEXPECTED_RANK_TYPE", `Rank call ${callIndex} uses unsupported type ${rankType}.`);
     const combination = `${ean}|${rankDate}|${locale}`;
@@ -1100,19 +1199,19 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
   }));
 
   const weeklyMetrics = [...productMetrics.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ean, metric]) => {
-    const unroundedGrossGms = metric.grossGms;
-    const unroundedGrossCommission = metric.grossCommission;
-    const unroundedLinkedReturnGms = metric.linkedReturnGms;
-    const unroundedLinkedReturnCommission = metric.linkedReturnCommission;
-    const unroundedProvisionalNetGms = unroundedGrossGms - unroundedLinkedReturnGms;
-    const unroundedProvisionalAfterCommission = unroundedProvisionalNetGms
-      - (unroundedGrossCommission - unroundedLinkedReturnCommission);
-    const grossGms = round(unroundedGrossGms, 2);
-    const grossCommission = round(unroundedGrossCommission, 2);
-    const linkedReturnGms = round(unroundedLinkedReturnGms, 2);
-    const linkedReturnCommission = round(unroundedLinkedReturnCommission, 2);
-    const provisionalNetGms = round(unroundedProvisionalNetGms, 2);
-    const provisionalAfterCommission = round(unroundedProvisionalAfterCommission, 2);
+    const grossGmsMinor = metric.grossGmsMinor;
+    const grossCommissionMinor = metric.grossCommissionMinor;
+    const linkedReturnGmsMinor = metric.linkedReturnGmsMinor;
+    const linkedReturnCommissionMinor = metric.linkedReturnCommissionMinor;
+    const provisionalNetGmsMinor = grossGmsMinor - linkedReturnGmsMinor;
+    const provisionalAfterCommissionMinor = provisionalNetGmsMinor
+      - (grossCommissionMinor - linkedReturnCommissionMinor);
+    const grossGms = minorToMajor(grossGmsMinor);
+    const grossCommission = minorToMajor(grossCommissionMinor);
+    const linkedReturnGms = minorToMajor(linkedReturnGmsMinor);
+    const linkedReturnCommission = minorToMajor(linkedReturnCommissionMinor);
+    const provisionalNetGms = minorToMajor(provisionalNetGmsMinor);
+    const provisionalAfterCommission = minorToMajor(provisionalAfterCommissionMinor);
     const reportedVisits = visitCoverageReady ? metric.visits : null;
     const visitsStatus = reportedVisits === null ? "not_ready" : "ready";
     const returnsStatus = metric.unlinkedReturns > 0 ? "ready_with_limits" : "ready";
@@ -1128,7 +1227,7 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
       linked_return_commission: linkedReturnCommission,
       provisional_net_gms: provisionalNetGms,
       provisional_revenue_after_commission: provisionalAfterCommission,
-      gross_shipped_asp: metric.grossUnits ? round(unroundedGrossGms / metric.grossUnits, 4) : null,
+      gross_shipped_asp: metric.grossUnits ? scaledRatioToNumber(grossGmsMinor, BigInt(metric.grossUnits) * 100n, 4) : null,
       product_visits: reportedVisits,
       trading_units_per_visit: reportedVisits ? round(metric.grossUnits / reportedVisits, 6) : null,
       commercial_status: shipmentReady ? "ready" : "not_ready",
@@ -1140,19 +1239,19 @@ async function buildPublication(claim: Claim, loaded: Awaited<ReturnType<typeof 
         "Trading units per visit is not order-cohort conversion.",
       ])],
       calculation_trace: {
-        roundingPolicy: "Each published monetary field is rounded once from unrounded source accumulators.",
-        unroundedInputs: {
-          grossShippedGms: unroundedGrossGms,
-          grossCommission: unroundedGrossCommission,
-          linkedReturnGms: unroundedLinkedReturnGms,
-          linkedReturnCommission: unroundedLinkedReturnCommission,
-          provisionalNetGms: unroundedProvisionalNetGms,
-          provisionalRevenueAfterCommission: unroundedProvisionalAfterCommission,
+        roundingPolicy: "Shipment lines and grouped return allocations use integer minor units with deterministic half-up division.",
+        minorUnits: {
+          grossShippedGms: grossGmsMinor.toString(),
+          grossCommission: grossCommissionMinor.toString(),
+          linkedReturnGms: linkedReturnGmsMinor.toString(),
+          linkedReturnCommission: linkedReturnCommissionMinor.toString(),
+          provisionalNetGms: provisionalNetGmsMinor.toString(),
+          provisionalRevenueAfterCommission: provisionalAfterCommissionMinor.toString(),
         },
-        grossShippedGms: `${metric.grossUnits} shipped units valued from outbound shipment lines`,
-        linkedReturnGms: `${metric.linkedReturns} return units allocated from exact shipment-line totals`,
-        provisionalNetGms: "unrounded gross shipped GMS - unrounded linked return GMS",
-        revenueAfterCommission: "unrounded provisional net GMS - (unrounded gross commission - unrounded linked return commission)",
+        grossShippedGms: `${metric.grossUnits} shipped units valued from exact shipment-line minor units`,
+        linkedReturnGms: `${metric.linkedReturns} return units allocated from exact shipment-line minor units`,
+        provisionalNetGms: "gross shipped GMS minor units - linked return GMS minor units",
+        revenueAfterCommission: "provisional net GMS minor units - (gross commission minor units - linked return commission minor units)",
       },
     };
   });
