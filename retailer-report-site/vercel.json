@@ -1,0 +1,6 @@
+{
+  "framework": "nextjs",
+  "functions": {
+    "app/api/internal/generate/route.ts": { "maxDuration": 300 }
+  }
+}
