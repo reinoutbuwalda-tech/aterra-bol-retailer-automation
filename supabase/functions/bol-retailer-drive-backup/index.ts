@@ -123,6 +123,36 @@ async function googleFetch(token: string, url: string, init: RequestInit = {}) {
   return result;
 }
 
+async function sendRetailerReportEmail(token: string, body: RecordValue) {
+  const year = Number(body.year);
+  const week = Number(body.week);
+  const url = String(body.url || "");
+  const status = String(body.reportStatus || "");
+  const summary = body.summary && typeof body.summary === "object" ? body.summary : {};
+  if (!Number.isInteger(year) || !Number.isInteger(week) || !/^https:\/\//.test(url) || !["ready", "ready_with_limits"].includes(status)) throw new Error("Invalid report email request.");
+  const dashboardUrl = new URL(url).origin;
+  const label = `${year}-W${String(week).padStart(2, "0")}`;
+  const subject = `Aterra Bol Retailer weekly report ${label}`;
+  const html = `<p>Hi Reinout en Thijs,</p><p>Het beveiligde Bol Retailer weekrapport voor <strong>${label}</strong> staat online.</p><ul><li>Status: ${status}</li><li>Units: ${summary.gross_shipped_units ?? 0}</li><li>Netto GMS: EUR ${summary.provisional_net_gms ?? 0}</li><li>Productbezoeken: ${summary.product_visits ?? "niet beschikbaar"}</li></ul><p><a href="${dashboardUrl}"><strong>Open het centrale Retailer-dashboard</strong></a></p><p><a href="${url}">Open direct het rapport voor ${label}</a></p><p>Sla de dashboardlink op als vaste ingang. Nieuwe weekrapporten verschijnen daar automatisch bovenaan en eerdere weken blijven beschikbaar.</p><p>Dit is operationele handelsinformatie en blijft boekhoudkundig voorlopig totdat settlement is afgestemd.</p>`;
+  const mime = [
+    "From: Aterra <aterra.eu@gmail.com>",
+    "To: aterra.eu@gmail.com, reinout.buwalda@gmail.com",
+    `Subject: =?UTF-8?B?${btoa(unescape(encodeURIComponent(subject)))}?=`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    btoa(unescape(encodeURIComponent(html))),
+  ].join("\r\n");
+  const raw = btoa(mime).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const result = await googleFetch(token, "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ raw }),
+  });
+  return result.json();
+}
+
 function escapeDriveQuery(value: string) {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
@@ -195,6 +225,13 @@ const SENSITIVE_KEYS = new Set([
   "secret",
 ]);
 
+function isSanitizedCountryDetails(value: unknown) {
+  if (value === "<redacted>") return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value as RecordValue);
+  return entries.length === 1 && entries[0][0] === "countryCode" && /^[A-Z]{2}$/.test(String(entries[0][1]));
+}
+
 function assertSanitized(value: unknown, path = "root") {
   if (Array.isArray(value)) {
     value.forEach((item, index) => assertSanitized(item, `${path}[${index}]`));
@@ -203,6 +240,7 @@ function assertSanitized(value: unknown, path = "root") {
   if (!value || typeof value !== "object") return;
   for (const [key, item] of Object.entries(value as RecordValue)) {
     const normalized = key.toLowerCase().replace(/[^a-z]/g, "");
+    if (normalized === "billingdetails" && isSanitizedCountryDetails(item)) continue;
     if (SENSITIVE_KEYS.has(normalized) && item !== "<redacted>") throw new Error(`Sensitive field is not redacted at ${path}.${key}.`);
     assertSanitized(item, `${path}.${key}`);
   }
@@ -519,6 +557,16 @@ Deno.serve(async request => {
   if (!provided || provided !== env("BOL_RETAILER_CRON_TOKEN")) return response({ status: "unauthorized" }, 401);
   let body: RecordValue;
   try { body = await request.json(); } catch { return response({ status: "invalid_request" }, 400); }
+  if (body.action === "report_email") {
+    const brokeredToken = request.headers.get("x-google-access-token")?.trim();
+    if (!brokeredToken) return response({ status: "invalid_request", reason: "Missing brokered Google access token." }, 400);
+    try {
+      const sent = await sendRetailerReportEmail(brokeredToken, body);
+      return response({ status: "complete", id: sent.id });
+    } catch (error) {
+      return response({ status: "failed", stage: "report_email", message: error instanceof Error ? error.message : "Email failed." }, 500);
+    }
+  }
   const trigger = String(body.trigger || "manual");
   const nowAmsterdam = dateInAmsterdam();
   const expectedLocalHour = Number(body.expectedLocalHour ?? 9);

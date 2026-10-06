@@ -1,0 +1,7 @@
+.next/
+node_modules/
+.env*
+.vercel/
+supabase/.temp/
+*.tsbuildinfo
+.vercel
