@@ -130,9 +130,10 @@ async function sendRetailerReportEmail(token: string, body: RecordValue) {
   const status = String(body.reportStatus || "");
   const summary = body.summary && typeof body.summary === "object" ? body.summary : {};
   if (!Number.isInteger(year) || !Number.isInteger(week) || !/^https:\/\//.test(url) || !["ready", "ready_with_limits"].includes(status)) throw new Error("Invalid report email request.");
+  const dashboardUrl = new URL(url).origin;
   const label = `${year}-W${String(week).padStart(2, "0")}`;
   const subject = `Aterra Bol Retailer weekly report ${label}`;
-  const html = `<p>Hi Reinout en Thijs,</p><p>Het beveiligde Bol Retailer weekrapport voor <strong>${label}</strong> staat online.</p><ul><li>Status: ${status}</li><li>Units: ${summary.gross_shipped_units ?? 0}</li><li>Netto GMS: EUR ${summary.provisional_net_gms ?? 0}</li><li>Productbezoeken: ${summary.product_visits ?? "niet beschikbaar"}</li></ul><p><a href="${url}">Open het beveiligde rapport</a></p><p>Dit is operationele handelsinformatie en blijft boekhoudkundig voorlopig totdat settlement is afgestemd.</p>`;
+  const html = `<p>Hi Reinout en Thijs,</p><p>Het beveiligde Bol Retailer weekrapport voor <strong>${label}</strong> staat online.</p><ul><li>Status: ${status}</li><li>Units: ${summary.gross_shipped_units ?? 0}</li><li>Netto GMS: EUR ${summary.provisional_net_gms ?? 0}</li><li>Productbezoeken: ${summary.product_visits ?? "niet beschikbaar"}</li></ul><p><a href="${dashboardUrl}"><strong>Open het centrale Retailer-dashboard</strong></a></p><p><a href="${url}">Open direct het rapport voor ${label}</a></p><p>Sla de dashboardlink op als vaste ingang. Nieuwe weekrapporten verschijnen daar automatisch bovenaan en eerdere weken blijven beschikbaar.</p><p>Dit is operationele handelsinformatie en blijft boekhoudkundig voorlopig totdat settlement is afgestemd.</p>`;
   const mime = [
     "From: Aterra <aterra.eu@gmail.com>",
     "To: aterra.eu@gmail.com, reinout.buwalda@gmail.com",
