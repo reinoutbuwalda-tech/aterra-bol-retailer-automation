@@ -195,6 +195,13 @@ const SENSITIVE_KEYS = new Set([
   "secret",
 ]);
 
+function isSanitizedCountryDetails(value: unknown) {
+  if (value === "<redacted>") return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value as RecordValue);
+  return entries.length === 1 && entries[0][0] === "countryCode" && /^[A-Z]{2}$/.test(String(entries[0][1]));
+}
+
 function assertSanitized(value: unknown, path = "root") {
   if (Array.isArray(value)) {
     value.forEach((item, index) => assertSanitized(item, `${path}[${index}]`));
@@ -203,6 +210,7 @@ function assertSanitized(value: unknown, path = "root") {
   if (!value || typeof value !== "object") return;
   for (const [key, item] of Object.entries(value as RecordValue)) {
     const normalized = key.toLowerCase().replace(/[^a-z]/g, "");
+    if (normalized === "billingdetails" && isSanitizedCountryDetails(item)) continue;
     if (SENSITIVE_KEYS.has(normalized) && item !== "<redacted>") throw new Error(`Sensitive field is not redacted at ${path}.${key}.`);
     assertSanitized(item, `${path}.${key}`);
   }
